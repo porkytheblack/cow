@@ -3,13 +3,13 @@ import { ChainAdapterRegistry } from "../adapters/chain/index.js"
 import { WalletConfigService } from "../config/index.js"
 import { isUsdc } from "../model/asset.js"
 import type { TransferIntent, TransferPlan, TransferStep } from "../model/transfer.js"
-import type { UnsignedTx } from "../model/transaction.js"
 import {
   FeeEstimationError,
   InsufficientBalanceError,
   UnsupportedChainError,
   UnsupportedRouteError,
 } from "../model/errors.js"
+import { CctpService } from "./cctp.js"
 import { randomBytes } from "./keyring-crypto.js"
 import { bytesToHex } from "@noble/hashes/utils"
 
@@ -31,7 +31,7 @@ export interface RouterServiceShape {
     | UnsupportedChainError
     | FeeEstimationError
     | InsufficientBalanceError,
-    ChainAdapterRegistry | WalletConfigService
+    ChainAdapterRegistry | WalletConfigService | CctpService
   >
 }
 
@@ -44,7 +44,7 @@ export const RouterServiceLive = Layer.succeed(RouterService, {
   plan: (intent) =>
     Effect.gen(function* () {
       const registry = yield* ChainAdapterRegistry
-      const configService = yield* WalletConfigService
+      const cctp = yield* CctpService
 
       const fromChain = intent.from.chain
       const toChain = intent.to.chain
@@ -78,44 +78,15 @@ export const RouterServiceLive = Layer.succeed(RouterService, {
         )
       }
 
-      const srcChainConfig = yield* configService.getChain(fromChain)
-      const dstChainConfig = yield* configService.getChain(toChain)
-
-      if (
-        srcChainConfig.cctpDomain === undefined ||
-        dstChainConfig.cctpDomain === undefined
-      ) {
-        return yield* Effect.fail(
-          new UnsupportedRouteError({
-            from: String(fromChain),
-            to: String(toChain),
-            asset: intent.asset.symbol,
-          }),
-        )
-      }
-
-      // Build the burn transaction. The mock adapter recognises `kind:
-      // "cctp-burn"` in its payload handler; real adapters will call the
-      // chain's TokenMessenger contract.
-      const srcAdapter = yield* registry.get(fromChain)
-      const burnTx: UnsignedTx = {
-        chain: fromChain,
+      // Delegate burn-tx construction to CctpService so the per-chain
+      // TokenMessenger encoding stays in one place (the source adapter).
+      const burnTx = yield* cctp.buildBurnTx({
+        sourceChain: fromChain,
+        destChain: toChain,
+        amount: intent.amount,
         from: intent.from.address,
-        payload: {
-          kind: "cctp-burn",
-          destChain: toChain,
-          destDomain: dstChainConfig.cctpDomain,
-          amount: intent.amount.toString(),
-          recipient: intent.to.address,
-        },
-        estimatedFee: 2_000n,
-        metadata: {
-          intent: `CCTP burn ${intent.amount} USDC → ${String(toChain)}`,
-          createdAt: Date.now(),
-        },
-      }
-      // Give the adapter a chance to validate/estimate if it wants to.
-      yield* srcAdapter.estimateFee(burnTx)
+        recipient: intent.to.address,
+      })
 
       const steps: TransferStep[] = [
         { type: "cctp-burn", sourceChain: fromChain, destChain: toChain, tx: burnTx },

@@ -27,6 +27,12 @@ export { makeMockFetchAdapter } from "./adapters/fetch/mock.js"
 
 export { StorageAdapter } from "./adapters/storage/index.js"
 export { InMemoryStorageAdapter } from "./adapters/storage/memory.js"
+export {
+  makeSecureStorageAdapter,
+  makeStringSecureStorageAdapter,
+  type SecureStoreHooks,
+  type StringBackedSecureStoreHooks,
+} from "./adapters/storage/secure-store.js"
 
 export { BackupAdapter, type BackupManifest } from "./adapters/backup/index.js"
 export { InMemoryBackupAdapter } from "./adapters/backup/memory.js"

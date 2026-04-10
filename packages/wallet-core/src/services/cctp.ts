@@ -1,20 +1,33 @@
 import { Context, Duration, Effect, Layer } from "effect"
-import { bytesToHex } from "@noble/hashes/utils"
+import { bytesToHex, hexToBytes } from "@noble/hashes/utils"
 import { ChainAdapterRegistry } from "../adapters/chain/index.js"
 import { FetchAdapter } from "../adapters/fetch/index.js"
 import { StorageAdapter } from "../adapters/storage/index.js"
 import { WalletConfigService } from "../config/index.js"
 import type { Attestation, BurnMessage, PendingCctpTransfer } from "../model/cctp.js"
 import type { ChainId } from "../model/chain.js"
-import type { UnsignedTx } from "../model/transaction.js"
+import type { TxReceipt, UnsignedTx } from "../model/transaction.js"
 import {
+  AuthDeniedError,
+  AuthTimeoutError,
+  BroadcastError,
   CctpAttestationTimeout,
   CctpMintError,
   FeeEstimationError,
+  KeyNotFoundError,
   StorageError,
   UnsupportedChainError,
   UnsupportedRouteError,
 } from "../model/errors.js"
+import { AuthGateService } from "./auth-gate.js"
+import { BroadcastService } from "./broadcast.js"
+import { KeyringService } from "./keyring.js"
+import { SignerService } from "./signer.js"
+
+export interface ResumeResult {
+  readonly transfer: PendingCctpTransfer
+  readonly mintReceipt: TxReceipt
+}
 
 export interface CctpServiceShape {
   readonly buildBurnTx: (params: {
@@ -55,6 +68,36 @@ export interface CctpServiceShape {
     readonly PendingCctpTransfer[],
     StorageError,
     StorageAdapter
+  >
+
+  /**
+   * Resume a pending CCTP transfer after restart. Picks up from whichever
+   * step was persisted last: awaits attestation if burn is stored, then
+   * builds + signs + broadcasts the mint, and updates the persisted status.
+   */
+  readonly resumePending: (
+    id: string,
+    recipient: string,
+    destChain: ChainId,
+  ) => Effect.Effect<
+    ResumeResult,
+    | StorageError
+    | CctpAttestationTimeout
+    | CctpMintError
+    | UnsupportedChainError
+    | FeeEstimationError
+    | BroadcastError
+    | AuthDeniedError
+    | AuthTimeoutError
+    | KeyNotFoundError,
+    | ChainAdapterRegistry
+    | SignerService
+    | BroadcastService
+    | StorageAdapter
+    | FetchAdapter
+    | WalletConfigService
+    | KeyringService
+    | AuthGateService
   >
 }
 
@@ -97,28 +140,16 @@ export const CctpServiceLive = Layer.succeed(CctpService, {
         )
       }
 
-      // Delegate actual tx-building to the source adapter. We can't just
-      // call buildTransferTx because CCTP needs a contract call, not a
-      // plain transfer. Mock adapters recognise `kind: "cctp-burn"`.
+      // Delegate tx building to the source chain adapter, which knows
+      // how to encode `TokenMessenger.depositForBurn` for its chain.
+      // Mock adapters return a `{ kind: "cctp-burn", ... }` payload.
       const adapter = yield* registry.get(sourceChain)
-      const tx: UnsignedTx = {
-        chain: sourceChain,
+      return yield* adapter.buildCctpBurnTx({
         from,
-        payload: {
-          kind: "cctp-burn",
-          destChain,
-          destDomain: dstConfig.cctpDomain,
-          amount: amount.toString(),
-          recipient,
-        },
-        estimatedFee: 2_000n,
-        metadata: {
-          intent: `CCTP burn ${amount} USDC → ${String(destChain)}`,
-          createdAt: Date.now(),
-        },
-      }
-      yield* adapter.estimateFee(tx)
-      return tx
+        destinationDomain: dstConfig.cctpDomain,
+        recipient,
+        amount,
+      })
     }),
 
   waitForAttestation: (burn) =>
@@ -156,30 +187,10 @@ export const CctpServiceLive = Layer.succeed(CctpService, {
     Effect.gen(function* () {
       const storage = yield* StorageAdapter
       const key = `${STORAGE_PREFIX}${transfer.id}`
-      // Re-serialise bigints and Uint8Arrays.
-      const serialisable = {
-        ...transfer,
-        burn: transfer.burn
-          ? {
-              ...transfer.burn,
-              nonce: transfer.burn.nonce.toString(),
-              messageBytes: bytesToHex(transfer.burn.messageBytes),
-            }
-          : undefined,
-        attestation: transfer.attestation
-          ? {
-              ...transfer.attestation,
-              message: {
-                ...transfer.attestation.message,
-                nonce: transfer.attestation.message.nonce.toString(),
-                messageBytes: bytesToHex(
-                  transfer.attestation.message.messageBytes,
-                ),
-              },
-            }
-          : undefined,
-      }
-      yield* storage.save(key, textEncoder.encode(JSON.stringify(serialisable)))
+      yield* storage.save(
+        key,
+        textEncoder.encode(JSON.stringify(serialisePending(transfer))),
+      )
     }),
 
   loadPending: () =>
@@ -191,15 +202,207 @@ export const CctpServiceLive = Layer.succeed(CctpService, {
         const bytes = yield* storage.load(key)
         if (!bytes) continue
         try {
-          const parsed = JSON.parse(textDecoder.decode(bytes)) as Record<string, unknown>
-          // Best-effort restore — callers only use .id / .status / .createdAt in practice.
-          results.push(parsed as unknown as PendingCctpTransfer)
+          const parsed = JSON.parse(textDecoder.decode(bytes)) as SerialisedPending
+          results.push(deserialisePending(parsed))
         } catch {
           continue
         }
       }
       return results
     }),
+
+  resumePending: (id, recipient, destChain) =>
+    Effect.gen(function* () {
+      const storage = yield* StorageAdapter
+      const signer = yield* SignerService
+      const broadcast = yield* BroadcastService
+      const fetcher = yield* FetchAdapter
+      const configService = yield* WalletConfigService
+      const cctp = configService.config.cctp
+
+      const key = `${STORAGE_PREFIX}${id}`
+      const bytes = yield* storage.load(key)
+      if (!bytes) {
+        return yield* Effect.fail(
+          new StorageError({
+            operation: "read",
+            key,
+            cause: "no pending CCTP transfer with that id",
+          }),
+        )
+      }
+      let current: PendingCctpTransfer
+      try {
+        current = deserialisePending(
+          JSON.parse(textDecoder.decode(bytes)) as SerialisedPending,
+        )
+      } catch (e) {
+        return yield* Effect.fail(
+          new StorageError({
+            operation: "read",
+            key,
+            cause: `failed to parse pending CCTP record: ${(e as Error).message}`,
+          }),
+        )
+      }
+
+      if (!current.burn) {
+        return yield* Effect.fail(
+          new CctpMintError({
+            destChain,
+            cause: "pending transfer has no burn payload to resume from",
+          }),
+        )
+      }
+
+      // 1. Get (or wait for) the attestation.
+      let attestation = current.attestation
+      if (!attestation) {
+        const awaiting: PendingCctpTransfer = {
+          ...current,
+          status: "awaiting-attestation",
+          updatedAt: Date.now(),
+        }
+        yield* storage.save(
+          key,
+          textEncoder.encode(JSON.stringify(serialisePending(awaiting))),
+        )
+        attestation = yield* pollCircleAttestation(
+          fetcher,
+          cctp.attestationApiUrl,
+          current.burn,
+          {
+            intervalMs: cctp.attestationPollIntervalMs,
+            timeoutMs: cctp.attestationTimeoutMs,
+          },
+        )
+      }
+
+      // Persist the attestation before we try to mint.
+      const attested: PendingCctpTransfer = {
+        ...current,
+        status: "attested",
+        attestation,
+        updatedAt: Date.now(),
+      }
+      yield* storage.save(
+        key,
+        textEncoder.encode(JSON.stringify(serialisePending(attested))),
+      )
+
+      // 2. Build and submit the mint on the destination chain.
+      const registry = yield* ChainAdapterRegistry
+      const adapter = yield* registry.get(destChain)
+      const mintTx = yield* adapter
+        .buildMintTx({
+          recipient,
+          messageBytes: attestation.message.messageBytes,
+          attestation: attestation.attestation,
+        })
+        .pipe(
+          Effect.catchTag("FeeEstimationError", (e) =>
+            Effect.fail(new CctpMintError({ destChain, cause: e })),
+          ),
+        )
+      const signed = yield* signer.sign(mintTx)
+      const mintReceipt = yield* broadcast.submit(signed)
+
+      const completed: PendingCctpTransfer = {
+        ...attested,
+        status: "completed",
+        mintTxHash: mintReceipt.hash,
+        updatedAt: Date.now(),
+      }
+      yield* storage.save(
+        key,
+        textEncoder.encode(JSON.stringify(serialisePending(completed))),
+      )
+
+      return { transfer: completed, mintReceipt }
+    }),
+})
+
+// --- Persistence codec ---------------------------------------------------
+
+interface SerialisedBurn {
+  readonly sourceDomain: number
+  readonly destDomain: number
+  readonly nonce: string
+  readonly burnTxHash: string
+  readonly messageBytes: string
+  readonly messageHash: string
+}
+
+interface SerialisedPending {
+  readonly id: string
+  readonly planId: string
+  readonly status: PendingCctpTransfer["status"]
+  readonly createdAt: number
+  readonly updatedAt: number
+  readonly mintTxHash?: string
+  readonly burn?: SerialisedBurn
+  readonly attestation?: {
+    readonly message: SerialisedBurn
+    readonly attestation: string
+  }
+}
+
+const serialiseBurn = (burn: BurnMessage): SerialisedBurn => ({
+  sourceDomain: burn.sourceDomain,
+  destDomain: burn.destDomain,
+  nonce: burn.nonce.toString(),
+  burnTxHash: burn.burnTxHash,
+  messageBytes: bytesToHex(burn.messageBytes),
+  messageHash: burn.messageHash,
+})
+
+const deserialiseBurn = (b: SerialisedBurn): BurnMessage => ({
+  sourceDomain: b.sourceDomain,
+  destDomain: b.destDomain,
+  nonce: BigInt(b.nonce),
+  burnTxHash: b.burnTxHash,
+  messageBytes: hexToBytes(b.messageBytes),
+  messageHash: b.messageHash,
+})
+
+const serialisePending = (
+  t: PendingCctpTransfer,
+): SerialisedPending => ({
+  id: t.id,
+  planId: t.planId,
+  status: t.status,
+  createdAt: t.createdAt,
+  updatedAt: t.updatedAt,
+  ...(t.mintTxHash !== undefined ? { mintTxHash: t.mintTxHash } : {}),
+  ...(t.burn ? { burn: serialiseBurn(t.burn) } : {}),
+  ...(t.attestation
+    ? {
+        attestation: {
+          message: serialiseBurn(t.attestation.message),
+          attestation: t.attestation.attestation,
+        },
+      }
+    : {}),
+})
+
+const deserialisePending = (
+  s: SerialisedPending,
+): PendingCctpTransfer => ({
+  id: s.id,
+  planId: s.planId,
+  status: s.status,
+  createdAt: s.createdAt,
+  updatedAt: s.updatedAt,
+  ...(s.mintTxHash !== undefined ? { mintTxHash: s.mintTxHash } : {}),
+  ...(s.burn ? { burn: deserialiseBurn(s.burn) } : {}),
+  ...(s.attestation
+    ? {
+        attestation: {
+          message: deserialiseBurn(s.attestation.message),
+          attestation: s.attestation.attestation,
+        },
+      }
+    : {}),
 })
 
 /**

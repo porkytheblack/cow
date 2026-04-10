@@ -17,6 +17,13 @@ export const DEFAULT_DERIVATION_PATHS: Partial<Record<ChainId, string>> = {
 /**
  * Circle CCTP V2 domain identifiers. These are used in burn messages
  * to identify the source/destination chain.
+ *
+ * NOTE: Sepolia has the same domain id as Ethereum mainnet (0) but is
+ * only used against the Circle *sandbox* attestation API. Never
+ * configure a wallet with both `evm:1` and `evm:11155111` in the same
+ * `WalletConfig.chains` — the domain collision would cause mint
+ * messages to resolve to whichever chain was registered first in the
+ * adapter map.
  */
 export const CCTP_DOMAINS: Partial<Record<ChainId, number>> = {
   "evm:1": 0,         // Ethereum
@@ -26,7 +33,7 @@ export const CCTP_DOMAINS: Partial<Record<ChainId, number>> = {
   solana: 5,          // Solana
   "evm:8453": 6,      // Base
   aptos: 9,           // Aptos
-  "evm:11155111": 0,  // Sepolia shares domain 0 with mainnet Ethereum in sandbox
+  "evm:11155111": 0,  // Sepolia (sandbox only — see note above)
 }
 
 /**
