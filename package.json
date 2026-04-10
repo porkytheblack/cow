@@ -1,0 +1,9 @@
+{
+  "name": "cow-workspace",
+  "private": true,
+  "scripts": {
+    "test": "pnpm --filter @wallet/core test",
+    "typecheck": "pnpm --filter @wallet/core typecheck"
+  },
+  "packageManager": "pnpm@10.33.0"
+}

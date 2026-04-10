@@ -1,0 +1,250 @@
+import { Effect } from "effect"
+import { bytesToHex } from "@noble/hashes/utils"
+import { sha256 } from "@noble/hashes/sha256"
+import type { AssetId } from "../../model/asset.js"
+import type { TokenBalance } from "../../model/balance.js"
+import type { BurnMessage } from "../../model/cctp.js"
+import type { ChainConfig, ChainId } from "../../model/chain.js"
+import type { SignedTx, TxReceipt, UnsignedTx } from "../../model/transaction.js"
+import { isUsdc } from "../../model/asset.js"
+import { BroadcastError } from "../../model/errors.js"
+import type { ChainAdapter } from "./index.js"
+
+interface MockState {
+  readonly balances: Map<string, bigint> // key: `${address}::${symbol}`
+  readonly receipts: Map<string, TxReceipt>
+  nonceCounter: bigint
+}
+
+const balanceKey = (address: string, asset: AssetId) =>
+  `${address}::${asset.symbol}`
+
+/**
+ * Deterministic mock chain adapter for tests. Keeps an in-memory ledger
+ * of balances and accepts every transaction as "confirmed". Useful for
+ * exercising the full Effect pipeline end-to-end without network calls.
+ *
+ * CCTP: parses burn payloads by inspection — each burn UnsignedTx payload
+ * carries `{ kind: "cctp-burn", destChain, amount, recipient }`.
+ */
+export const makeMockChainAdapter = (config: ChainConfig): ChainAdapter => {
+  const state: MockState = {
+    balances: new Map(),
+    receipts: new Map(),
+    nonceCounter: 1n,
+  }
+
+  // Fund a default balance for the test wallet so transfers can go through.
+  // Tests can override by writing to state.balances.
+  const seedBalance = (address: string, asset: AssetId, amount: bigint) => {
+    state.balances.set(balanceKey(address, asset), amount)
+  }
+
+  const getBalanceSync = (address: string, asset: AssetId): bigint =>
+    state.balances.get(balanceKey(address, asset)) ?? 0n
+
+  const hashOf = (data: Uint8Array): string => bytesToHex(sha256(data)).slice(0, 64)
+
+  const adapter: ChainAdapter = {
+    chainId: config.chainId,
+
+    deriveAddress: (publicKey) =>
+      Effect.succeed(
+        // Deterministic synthetic address from public key + chain tag.
+        // Real adapters delegate to their SDKs — this is shape-compatible.
+        `${config.chainId}:${bytesToHex(sha256(publicKey)).slice(0, 40)}`,
+      ),
+
+    buildTransferTx: ({ from, to, asset, amount }) =>
+      Effect.sync(() => {
+        const tx: UnsignedTx = {
+          chain: config.chainId,
+          from,
+          payload: {
+            kind: "direct-transfer",
+            to,
+            asset,
+            amount: amount.toString(),
+          },
+          estimatedFee: 1_000n,
+          metadata: {
+            intent: `Transfer ${amount} ${asset.symbol} to ${to}`,
+            createdAt: Date.now(),
+          },
+        }
+        return tx
+      }),
+
+    estimateFee: (_tx) => Effect.succeed(1_000n),
+
+    broadcast: (signed) =>
+      Effect.sync(() => {
+        const payload = signed.unsigned.payload as {
+          kind: string
+          to?: string
+          asset?: AssetId
+          amount?: string
+          destChain?: ChainId
+          recipient?: string
+        }
+
+        if (payload.kind === "direct-transfer" && payload.asset && payload.amount) {
+          const amt = BigInt(payload.amount)
+          const fromBal = getBalanceSync(signed.unsigned.from, payload.asset)
+          if (fromBal < amt) {
+            throw new BroadcastError({
+              chain: config.chainId,
+              hash: signed.hash,
+              cause: `insufficient balance: ${fromBal} < ${amt}`,
+            })
+          }
+          state.balances.set(
+            balanceKey(signed.unsigned.from, payload.asset),
+            fromBal - amt,
+          )
+          if (payload.to) {
+            const toBal = getBalanceSync(payload.to, payload.asset)
+            state.balances.set(balanceKey(payload.to, payload.asset), toBal + amt)
+          }
+        }
+
+        const receipt: TxReceipt = {
+          chain: config.chainId,
+          hash: signed.hash,
+          status: "confirmed",
+          blockNumber: state.nonceCounter++,
+          fee: 1_000n,
+          raw: payload,
+        }
+        state.receipts.set(signed.hash, receipt)
+        return receipt
+      }).pipe(
+        Effect.catchAllDefect((defect) =>
+          defect instanceof BroadcastError
+            ? Effect.fail(defect)
+            : Effect.die(defect),
+        ),
+      ) as Effect.Effect<TxReceipt, BroadcastError>,
+
+    getBalance: (address, asset) =>
+      Effect.succeed(getBalanceSync(address, asset)),
+
+    getAllBalances: (address) =>
+      Effect.sync(() => {
+        const out: TokenBalance[] = []
+        for (const [k, v] of state.balances.entries()) {
+          if (!k.startsWith(`${address}::`)) continue
+          const symbol = k.slice(address.length + 2)
+          out.push({
+            asset: {
+              chain: config.chainId,
+              type: symbol === config.nativeAsset.symbol ? "native" : "token",
+              symbol,
+              decimals: 6,
+            },
+            balance: v,
+            address,
+          })
+        }
+        return out
+      }),
+
+    sign: (tx, privateKey) =>
+      Effect.sync(() => {
+        // Deterministic synthetic signature: hash(payload || privateKey)
+        const payloadBytes = new TextEncoder().encode(JSON.stringify(tx.payload))
+        const combined = new Uint8Array(payloadBytes.length + privateKey.length)
+        combined.set(payloadBytes, 0)
+        combined.set(privateKey, payloadBytes.length)
+        const sig = sha256(combined)
+        const raw = new Uint8Array(payloadBytes.length + sig.length)
+        raw.set(payloadBytes, 0)
+        raw.set(sig, payloadBytes.length)
+        const hash = hashOf(raw)
+        return {
+          chain: tx.chain,
+          raw,
+          hash,
+          unsigned: tx,
+        }
+      }),
+
+    extractBurnMessage: (receipt) =>
+      Effect.sync(() => {
+        const payload = receipt.raw as {
+          kind: string
+          destChain?: ChainId
+          amount?: string
+          recipient?: string
+        }
+        if (payload.kind !== "cctp-burn") {
+          throw new BroadcastError({
+            chain: config.chainId,
+            hash: receipt.hash,
+            cause: "receipt is not a CCTP burn",
+          })
+        }
+        const messageBytes = new TextEncoder().encode(
+          JSON.stringify({
+            src: config.chainId,
+            dst: payload.destChain,
+            amount: payload.amount,
+            recipient: payload.recipient,
+            burnTxHash: receipt.hash,
+          }),
+        )
+        const messageHash = bytesToHex(sha256(messageBytes))
+        const burn: BurnMessage = {
+          sourceDomain: config.cctpDomain ?? 0,
+          destDomain: 0, // filled by caller as needed
+          nonce: BigInt("0x" + messageHash.slice(0, 16)),
+          burnTxHash: receipt.hash,
+          messageBytes,
+          messageHash,
+        }
+        return burn
+      }).pipe(
+        Effect.catchAllDefect((defect) =>
+          defect instanceof BroadcastError
+            ? Effect.fail(defect)
+            : Effect.die(defect),
+        ),
+      ) as Effect.Effect<BurnMessage, BroadcastError>,
+
+    buildMintTx: ({ recipient, messageBytes, attestation }) =>
+      Effect.sync(() => ({
+        chain: config.chainId,
+        from: recipient,
+        payload: {
+          kind: "cctp-mint",
+          messageBytes: bytesToHex(messageBytes),
+          attestation,
+          recipient,
+        },
+        estimatedFee: 1_000n,
+        metadata: {
+          intent: `CCTP mint to ${recipient}`,
+          createdAt: Date.now(),
+        },
+      })),
+  }
+
+  // Expose seeding for tests via a hidden handle.
+  ;(adapter as unknown as { __seed: typeof seedBalance }).__seed = seedBalance
+
+  return adapter
+}
+
+/**
+ * Build a Ref-carrying mock adapter — useful when tests need to reach
+ * in and pre-seed balances. Returns both the adapter and its state.
+ */
+export const makeMockChainAdapterWithState = (config: ChainConfig) => {
+  const adapter = makeMockChainAdapter(config)
+  const seedBalance = (address: string, asset: AssetId, amount: bigint) => {
+    ;(adapter as unknown as {
+      __seed: (a: string, b: AssetId, c: bigint) => void
+    }).__seed(address, asset, amount)
+  }
+  return { adapter, seedBalance }
+}
