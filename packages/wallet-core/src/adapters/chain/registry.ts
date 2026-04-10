@@ -1,10 +1,14 @@
 import { Effect, Layer } from "effect"
+import type { Aptos } from "@aptos-labs/ts-sdk"
 import { WalletConfigService } from "../../config/index.js"
-import type { ChainId } from "../../model/chain.js"
+import type { ChainConfig, ChainId } from "../../model/chain.js"
 import { UnsupportedChainError } from "../../model/errors.js"
 import { FetchAdapter } from "../fetch/index.js"
 import type { ChainAdapter } from "./index.js"
 import { ChainAdapterRegistry } from "./index.js"
+import { makeEvmChainAdapter } from "./evm.js"
+import { makeSolanaChainAdapter } from "./solana.js"
+import { makeAptosChainAdapter } from "./aptos.js"
 import { makeMockChainAdapter } from "./mock.js"
 
 /**
@@ -13,31 +17,60 @@ import { makeMockChainAdapter } from "./mock.js"
  * Reads `WalletConfigService` and instantiates one adapter per configured
  * chain. The `kind` field on each ChainConfig selects the implementation:
  *
- *   - "mock"   -> makeMockChainAdapter (in-memory, deterministic)
- *   - "aptos"  -> real Aptos adapter  (deferred — see ARCHITECTURE.md §11.15)
- *   - "solana" -> real Solana adapter (deferred)
- *   - "evm"    -> real EVM adapter    (deferred)
+ *   - "mock"   -> makeMockChainAdapter (in-memory, deterministic — tests)
+ *   - "evm"    -> makeEvmChainAdapter  (viem + FetchAdapter transport)
+ *   - "solana" -> makeSolanaChainAdapter (@solana/web3.js + FetchAdapter)
+ *   - "aptos"  -> falls back to mock unless an Aptos client is supplied
+ *                 via `aptosClients` — use `makeChainAdapterRegistryLayer`
+ *                 with `makeAptosChainAdapter` for full Aptos support.
  *
- * Until the real adapters land, "aptos"/"solana"/"evm" fall through to the
- * mock implementation. This keeps the integration surface stable and lets
- * downstream services be tested end-to-end today.
+ * Consumers who need tighter control (e.g. passing a custom Aptos client
+ * or a CCTP contract map) should build their own registry via
+ * `makeChainAdapterRegistryLayer` and pass it as `createWallet`'s
+ * `chainRegistry` override.
  */
 export const ChainAdapterRegistryLive = Layer.effect(
   ChainAdapterRegistry,
   Effect.gen(function* () {
     const configService = yield* WalletConfigService
-    // FetchAdapter is reserved for real chain adapters; mock adapters don't
-    // need it, but we yield it here so the dependency is declared.
-    const _fetcher = yield* FetchAdapter
-    void _fetcher
+    const fetcher = yield* FetchAdapter
+    const cctpContractMap = configService.config.cctp.contractAddresses
 
     const adapters = new Map<ChainId, ChainAdapter>()
     for (const chain of configService.config.chains) {
-      // TODO: once real adapters ship, dispatch on chain.kind:
-      //   case "aptos":  adapters.set(chain.chainId, makeAptosAdapter(chain, fetcher))
-      //   case "solana": adapters.set(chain.chainId, makeSolanaAdapter(chain, fetcher))
-      //   case "evm":    adapters.set(chain.chainId, makeEvmAdapter(chain, fetcher))
-      adapters.set(chain.chainId, makeMockChainAdapter(chain))
+      switch (chain.kind) {
+        case "evm": {
+          const cctp = cctpContractMap[chain.chainId]
+          adapters.set(
+            chain.chainId,
+            makeEvmChainAdapter({
+              chainConfig: chain,
+              fetcher,
+              cctpContracts: cctp
+                ? {
+                    tokenMessenger: cctp.tokenMessenger as `0x${string}`,
+                    messageTransmitter: cctp.messageTransmitter as `0x${string}`,
+                    usdcToken: cctp.usdcToken as `0x${string}`,
+                  }
+                : undefined,
+            }),
+          )
+          break
+        }
+        case "solana": {
+          adapters.set(
+            chain.chainId,
+            makeSolanaChainAdapter({ chainConfig: chain, fetcher }),
+          )
+          break
+        }
+        case "aptos":
+        case "mock":
+        default: {
+          adapters.set(chain.chainId, makeMockChainAdapter(chain))
+          break
+        }
+      }
     }
 
     return {
@@ -51,6 +84,85 @@ export const ChainAdapterRegistryLive = Layer.effect(
     }
   }),
 )
+
+/**
+ * Build a registry layer with full Aptos support. Consumers provide a
+ * pre-configured `Aptos` client per Aptos chain id — the adapter delegates
+ * all HTTP to that client.
+ */
+export const makeAptosAwareRegistryLive = (
+  aptosClients: ReadonlyMap<ChainId, Aptos>,
+): Layer.Layer<
+  ChainAdapterRegistry,
+  never,
+  WalletConfigService | FetchAdapter
+> =>
+  Layer.effect(
+    ChainAdapterRegistry,
+    Effect.gen(function* () {
+      const configService = yield* WalletConfigService
+      const fetcher = yield* FetchAdapter
+      const cctpContractMap = configService.config.cctp.contractAddresses
+
+      const adapters = new Map<ChainId, ChainAdapter>()
+      for (const chain of configService.config.chains) {
+        switch (chain.kind) {
+          case "evm": {
+            const cctp = cctpContractMap[chain.chainId]
+            adapters.set(
+              chain.chainId,
+              makeEvmChainAdapter({
+                chainConfig: chain,
+                fetcher,
+                cctpContracts: cctp
+                  ? {
+                      tokenMessenger: cctp.tokenMessenger as `0x${string}`,
+                      messageTransmitter: cctp.messageTransmitter as `0x${string}`,
+                      usdcToken: cctp.usdcToken as `0x${string}`,
+                    }
+                  : undefined,
+              }),
+            )
+            break
+          }
+          case "solana":
+            adapters.set(
+              chain.chainId,
+              makeSolanaChainAdapter({ chainConfig: chain, fetcher }),
+            )
+            break
+          case "aptos": {
+            const client = aptosClients.get(chain.chainId)
+            if (!client) {
+              adapters.set(chain.chainId, makeMockChainAdapter(chain))
+              break
+            }
+            adapters.set(
+              chain.chainId,
+              makeAptosChainAdapter({ chainConfig: chain, aptosClient: client }),
+            )
+            break
+          }
+          case "mock":
+          default:
+            adapters.set(chain.chainId, makeMockChainAdapter(chain))
+            break
+        }
+      }
+      return {
+        get: (chainId) => {
+          const adapter = adapters.get(chainId)
+          return adapter
+            ? Effect.succeed(adapter)
+            : Effect.fail(new UnsupportedChainError({ chain: String(chainId) }))
+        },
+        supported: () => Array.from(adapters.keys()),
+      }
+    }),
+  )
+
+// Re-export ChainConfig for consumers building adapters directly.
+export type { ChainConfig }
 
 /**
  * Build a ChainAdapterRegistry layer from a pre-built map of adapters.

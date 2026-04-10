@@ -11,7 +11,7 @@ import { hkdf } from "@noble/hashes/hkdf"
 import { hmac } from "@noble/hashes/hmac"
 import { sha256 } from "@noble/hashes/sha256"
 import { sha512 } from "@noble/hashes/sha512"
-import { keccak_256 } from "@noble/hashes/sha3"
+import { keccak_256, sha3_256 } from "@noble/hashes/sha3"
 import { gcm } from "@noble/ciphers/aes"
 import { bytesToHex } from "@noble/hashes/utils"
 
@@ -135,16 +135,16 @@ export const deriveKeypair = (
 
 const deriveAddressForChain = (chain: string, publicKey: Uint8Array): string => {
   if (chain === "aptos") {
-    // Aptos single-key account: sha256(pubkey || 0x00), hex-prefixed.
+    // Aptos AuthenticationKey = sha3_256(pubkey || scheme_byte).
+    // scheme_byte = 0x00 for single-signer Ed25519.
     const data = new Uint8Array(publicKey.length + 1)
     data.set(publicKey, 0)
     data[publicKey.length] = 0x00
-    return "0x" + bytesToHex(sha256(data))
+    return "0x" + bytesToHex(sha3_256(data))
   }
   if (chain === "solana") {
-    // Solana addresses are base58(pubkey); we return hex here to avoid a
-    // base58 dep. Mock adapters don't care about format.
-    return bytesToHex(publicKey)
+    // Solana addresses are base58(pubkey).
+    return base58Encode(publicKey)
   }
   if (chain.startsWith("evm:")) {
     // EVM address = last 20 bytes of keccak256(uncompressed pubkey).
@@ -153,6 +153,50 @@ const deriveAddressForChain = (chain: string, publicKey: Uint8Array): string => 
   }
   // Default: deterministic hex prefix, matches mock adapter shape.
   return `${chain}:${bytesToHex(sha256(publicKey)).slice(0, 40)}`
+}
+
+// --- Base58 (Bitcoin alphabet) -----------------------------------------
+// Used for Solana addresses. Tiny, no deps.
+
+const BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+export const base58Encode = (bytes: Uint8Array): string => {
+  if (bytes.length === 0) return ""
+  let num = 0n
+  for (const b of bytes) num = num * 256n + BigInt(b)
+  let str = ""
+  while (num > 0n) {
+    const rem = num % 58n
+    num = num / 58n
+    str = BASE58_ALPHABET[Number(rem)] + str
+  }
+  // Preserve leading zero bytes as "1" characters.
+  for (const b of bytes) {
+    if (b === 0) str = "1" + str
+    else break
+  }
+  return str
+}
+
+export const base58Decode = (s: string): Uint8Array => {
+  if (s.length === 0) return new Uint8Array(0)
+  let num = 0n
+  for (const ch of s) {
+    const idx = BASE58_ALPHABET.indexOf(ch)
+    if (idx < 0) throw new Error(`Invalid base58 character: ${ch}`)
+    num = num * 58n + BigInt(idx)
+  }
+  const bytes: number[] = []
+  while (num > 0n) {
+    bytes.unshift(Number(num % 256n))
+    num = num / 256n
+  }
+  // Add back leading zero bytes (each "1" in prefix).
+  for (const ch of s) {
+    if (ch === "1") bytes.unshift(0)
+    else break
+  }
+  return new Uint8Array(bytes)
 }
 
 /**

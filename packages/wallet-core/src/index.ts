@@ -30,6 +30,18 @@ export { InMemoryStorageAdapter } from "./adapters/storage/memory.js"
 
 export { BackupAdapter, type BackupManifest } from "./adapters/backup/index.js"
 export { InMemoryBackupAdapter } from "./adapters/backup/memory.js"
+export {
+  FileExportBackupAdapter,
+  FileExportBackupAdapterFromFile,
+  packBackupFile,
+  unpackBackupFile,
+} from "./adapters/backup/file-export.js"
+export {
+  makeBridgedBackupAdapter,
+  iCloudBackupAdapter,
+  googleDriveBackupAdapter,
+  type BridgedBackupHooks,
+} from "./adapters/backup/bridged.js"
 
 export {
   ChainAdapterRegistry,
@@ -39,14 +51,29 @@ export {
 export {
   ChainAdapterRegistryLive,
   makeChainAdapterRegistryLayer,
+  makeAptosAwareRegistryLive,
 } from "./adapters/chain/registry.js"
 export {
   makeMockChainAdapter,
   makeMockChainAdapterWithState,
 } from "./adapters/chain/mock.js"
+export { makeEvmChainAdapter, buildEvmCctpBurnTx } from "./adapters/chain/evm.js"
+export { makeSolanaChainAdapter } from "./adapters/chain/solana.js"
+export { makeAptosChainAdapter } from "./adapters/chain/aptos.js"
+export { jsonRpcCall } from "./adapters/chain/json-rpc.js"
 
 // Services
 export { AuthGateService, TestAuthGate, DenyingAuthGate } from "./services/auth-gate.js"
+export {
+  makeCallbackAuthGate,
+  deriveEncryptionKeyFromSecret,
+  type CallbackAuthGateHooks,
+} from "./services/auth-gate-callback.js"
+export {
+  makeWebAuthnAuthGate,
+  type WebAuthnAuthGateOptions,
+} from "./services/auth-gate-webauthn.js"
+export { base58Encode, base58Decode } from "./services/keyring-crypto.js"
 export { KeyringService, KeyringServiceLive } from "./services/keyring.js"
 export { SignerService, SignerServiceLive } from "./services/signer.js"
 export { BroadcastService, BroadcastServiceLive } from "./services/broadcast.js"
