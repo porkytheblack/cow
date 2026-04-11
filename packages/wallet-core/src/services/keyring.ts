@@ -20,18 +20,19 @@ import {
   mnemonicIsValid,
   mnemonicToSeed,
   randomBytes,
+  signMessageForChain,
 } from "./keyring-crypto.js"
 
 /**
  * On-disk layout (via StorageAdapter):
  *
- *   keyring:mnemonic  -> encrypted BIP-39 mnemonic phrase (utf8 bytes)
+ *   keyring:mnemonic  -> BIP-39 mnemonic phrase (utf8 bytes)
  *   keyring:keys      -> JSON-encoded array of StoredDerivedKey entries
- *   keyring:salt      -> 16 bytes of salt for HKDF key derivation
- *   keyring:nonce     -> 12 bytes nonce for mnemonic AEAD
  *
- * Private keys themselves live only transiently in memory inside this
- * service. Nothing outside KeyringService ever sees a raw private key.
+ * Private keys live only transiently inside this service — they're
+ * loaded, used for a single signing operation, then zeroed. The
+ * signing flow exposed via `signBytes` returns only signatures; the
+ * key bytes never cross the service boundary.
  */
 
 interface StoredDerivedKey {
@@ -45,8 +46,6 @@ interface StoredDerivedKey {
 const STORAGE_KEYS = {
   mnemonic: "keyring:mnemonic",
   keys: "keyring:keys",
-  salt: "keyring:salt",
-  nonce: "keyring:nonce",
 } as const
 
 export interface KeyringServiceShape {
@@ -74,6 +73,17 @@ export interface KeyringServiceShape {
     StorageAdapter
   >
 
+  /**
+   * Sign the supplied bytes with the chain-appropriate curve and
+   * return only the signature. The private key is loaded into a
+   * transient buffer, used, and zeroed before this effect returns —
+   * it is not visible to any service outside this layer.
+   *
+   *   - ed25519 chains (aptos, solana): `data` is the message bytes;
+   *     the result is the 64-byte signature.
+   *   - secp256k1 chains (evm:*): `data` is the 32-byte message digest;
+   *     the result is 65 bytes = r || s || recovery.
+   */
   readonly signBytes: (
     chain: ChainId,
     data: Uint8Array,
@@ -178,7 +188,9 @@ export const KeyringServiceLive = Layer.succeed(
 
         const mnemonic: Mnemonic = {
           phrase,
-          // We don't expose raw entropy through the public API, just the seed-equivalent.
+          // `entropy` here carries the first 32 bytes of the BIP-39
+          // seed rather than the raw mnemonic entropy — we never
+          // expose the unprocessed entropy through the public API.
           entropy: seed.slice(0, 32),
         }
         const keys = stored.map(toDerivedKey)
@@ -198,7 +210,13 @@ export const KeyringServiceLive = Layer.succeed(
         const stored: StoredDerivedKey[] = []
         for (const chain of configService.config.chains) {
           const path = configService.config.keyring.derivationPaths[chain.chainId]
-          if (!path) continue
+          if (!path) {
+            return yield* Effect.fail(
+              new KeyGenerationError({
+                message: `No derivation path configured for chain ${String(chain.chainId)}`,
+              }),
+            )
+          }
           try {
             const kp = deriveKeypair(String(chain.chainId), path, seed)
             stored.push({
@@ -239,7 +257,7 @@ export const KeyringServiceLive = Layer.succeed(
         return keys.map(toDerivedKey)
       }),
 
-    signBytes: (chain, _data, authProof) =>
+    signBytes: (chain, data, authProof) =>
       Effect.gen(function* () {
         if (!authProof || !authProof.method) {
           return yield* Effect.fail(
@@ -252,9 +270,23 @@ export const KeyringServiceLive = Layer.succeed(
         if (!found) {
           return yield* Effect.fail(new KeyNotFoundError({ chain: String(chain) }))
         }
-        // Return raw private key bytes to the caller. SignerService passes
-        // these straight into ChainAdapter.sign() and discards immediately.
-        return hexToBytes(found.privateKeyHex)
+        // The private key is loaded into a transient local, used to
+        // produce a curve-specific signature, then zeroed. Only the
+        // signature leaves this service.
+        const privateKey = hexToBytes(found.privateKeyHex)
+        let signature: Uint8Array
+        try {
+          signature = signMessageForChain(String(chain), data, privateKey)
+        } catch (e) {
+          privateKey.fill(0)
+          return yield* Effect.fail(
+            new AuthDeniedError({
+              reason: `signing failed for ${String(chain)}: ${(e as Error).message}`,
+            }),
+          )
+        }
+        privateKey.fill(0)
+        return signature
       }),
 
     exportEncrypted: (encryptionKey) =>

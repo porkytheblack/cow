@@ -237,3 +237,55 @@ export const randomBytes = (n: number): Uint8Array => {
   cryptoObj.getRandomValues(out)
   return out
 }
+
+/**
+ * Sign a message with the curve-appropriate algorithm for a chain. Used
+ * internally by KeyringService so that private keys never leave the
+ * service. Chain adapters produce the input bytes via
+ * `buildSigningMessage` and receive the resulting signature via
+ * `attachSignature`.
+ *
+ *   - ed25519 (aptos, solana): signs the raw message; returns 64 bytes.
+ *   - secp256k1 (evm:*):        signs a 32-byte message digest; returns
+ *     65 bytes = r (32) || s (32) || recovery (1).
+ */
+export const signMessageForChain = (
+  chain: string,
+  message: Uint8Array,
+  privateKey: Uint8Array,
+): Uint8Array => {
+  const { curve } = curveFor(chain)
+  if (curve === "ed25519") {
+    return ed25519.sign(message, privateKey)
+  }
+  // secp256k1: must be a 32-byte message digest.
+  if (message.length !== 32) {
+    throw new Error(
+      `secp256k1 signing requires a 32-byte digest, got ${message.length} bytes`,
+    )
+  }
+  const sig = secp256k1.sign(message, privateKey)
+  const compact = sig.toCompactRawBytes()
+  const out = new Uint8Array(65)
+  out.set(compact, 0)
+  out[64] = sig.recovery ?? 0
+  return out
+}
+
+/**
+ * Derive the public key for a chain from a raw private key. Used by
+ * SignerService alongside `signMessageForChain` so ChainAdapter
+ * `attachSignature` always has a public key to build authenticators from.
+ */
+export const publicKeyForChain = (
+  chain: string,
+  privateKey: Uint8Array,
+): Uint8Array => {
+  const { curve } = curveFor(chain)
+  if (curve === "ed25519") {
+    return ed25519.getPublicKey(privateKey)
+  }
+  // secp256k1 uncompressed without the 0x04 prefix (64 bytes) — matches
+  // what EVM address derivation expects.
+  return secp256k1.getPublicKey(privateKey, false).slice(1)
+}

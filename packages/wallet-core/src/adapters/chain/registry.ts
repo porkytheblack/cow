@@ -20,9 +20,12 @@ import { makeMockChainAdapter } from "./mock.js"
  *   - "mock"   -> makeMockChainAdapter (in-memory, deterministic — tests)
  *   - "evm"    -> makeEvmChainAdapter  (viem + FetchAdapter transport)
  *   - "solana" -> makeSolanaChainAdapter (@solana/web3.js + FetchAdapter)
- *   - "aptos"  -> falls back to mock unless an Aptos client is supplied
- *                 via `aptosClients` — use `makeChainAdapterRegistryLayer`
- *                 with `makeAptosChainAdapter` for full Aptos support.
+ *   - "aptos"  -> falls back to mock and emits a warning to
+ *                 `console.warn`, because the Aptos SDK needs a
+ *                 caller-constructed `Aptos` client — use
+ *                 `makeAptosAwareRegistryLive(aptosClients)` below, or
+ *                 build a custom registry via
+ *                 `makeChainAdapterRegistryLayer`, for production Aptos.
  *
  * Consumers who need tighter control (e.g. passing a custom Aptos client
  * or a CCTP contract map) should build their own registry via
@@ -64,7 +67,19 @@ export const ChainAdapterRegistryLive = Layer.effect(
           )
           break
         }
-        case "aptos":
+        case "aptos": {
+          // Aptos requires a caller-constructed SDK client. Loudly
+          // signal the silent fallback so nothing ships to prod
+          // thinking it has a real Aptos adapter wired up.
+          // eslint-disable-next-line no-console
+          console.warn(
+            `[wallet-core] ChainAdapterRegistryLive: chain "${String(
+              chain.chainId,
+            )}" has kind "aptos" but no Aptos client was supplied — falling back to makeMockChainAdapter. Use makeAptosAwareRegistryLive(aptosClients) for a real Aptos adapter.`,
+          )
+          adapters.set(chain.chainId, makeMockChainAdapter(chain))
+          break
+        }
         case "mock":
         default: {
           adapters.set(chain.chainId, makeMockChainAdapter(chain))

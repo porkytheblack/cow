@@ -1,10 +1,16 @@
 import { Effect } from "effect"
 import {
-  Account,
   AccountAddress,
+  AccountAuthenticatorEd25519,
   Aptos,
-  Ed25519PrivateKey,
+  Deserializer,
+  Ed25519PublicKey,
+  Ed25519Signature,
+  RawTransaction,
+  SimpleTransaction,
+  generateSigningMessageForTransaction,
 } from "@aptos-labs/ts-sdk"
+import { ed25519 } from "@noble/curves/ed25519"
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils"
 import { sha3_256 } from "@noble/hashes/sha3"
 import type { AssetId } from "../../model/asset.js"
@@ -16,6 +22,7 @@ import {
   BroadcastError,
   FeeEstimationError,
   UnsupportedChainError,
+  UnsupportedRouteError,
 } from "../../model/errors.js"
 import type { ChainAdapter } from "./index.js"
 
@@ -43,18 +50,22 @@ const DEFAULT_APTOS_USDC_METADATA =
 
 interface AptosPayload {
   readonly kind: "direct-transfer" | "fungible-transfer" | "cctp-burn" | "cctp-mint"
-  /** Serialised Aptos `SimpleTransaction` bytes (hex). */
+  /**
+   * BCS-serialized Aptos `RawTransaction` bytes (hex). Re-hydrated into
+   * a `SimpleTransaction` at signing and broadcast time.
+   */
   readonly rawTxHex: string
   readonly asset?: AssetId
   readonly recipient?: string
   readonly amount?: string
 }
 
-const privateKeyFromBytes = (bytes: Uint8Array): Ed25519PrivateKey =>
-  new Ed25519PrivateKey(bytes)
-
-const accountFromPrivateKey = (bytes: Uint8Array): Account =>
-  Account.fromPrivateKey({ privateKey: privateKeyFromBytes(bytes) })
+const rehydrateSimpleTransaction = (rawTxHex: string): SimpleTransaction => {
+  const bytes = hexToBytes(rawTxHex)
+  const deserializer = new Deserializer(bytes)
+  const rawTx = RawTransaction.deserialize(deserializer)
+  return new SimpleTransaction(rawTx)
+}
 
 // --- Factory ------------------------------------------------------------
 
@@ -158,65 +169,152 @@ export const makeAptosChainAdapter = (
 
     estimateFee: (_tx) => Effect.succeed(2_000n),
 
-    sign: (tx, privateKey) =>
-      Effect.tryPromise({
-        try: async () => {
+    buildSigningMessage: (tx) =>
+      Effect.try({
+        try: () => {
           const payload = tx.payload as AptosPayload
-          const account = accountFromPrivateKey(privateKey)
-          // Rebuild the SimpleTransaction by asking the SDK — this
-          // requires re-running build.simple since we can't cheaply
-          // reconstruct it from raw BCS bytes without more SDK plumbing.
-          // We fall back to signing the rawTxHex as arbitrary bytes,
-          // which matches the authenticator shape for ed25519.
-          const message = hexToBytes(payload.rawTxHex)
-          const signature = account.sign(message)
-          // Concatenate sig and pubkey to form the authenticator blob.
-          const sigBytes = signature.toUint8Array()
-          const pubkeyBytes = account.publicKey.toUint8Array()
-          const raw = new Uint8Array(message.length + sigBytes.length + pubkeyBytes.length)
-          raw.set(message, 0)
-          raw.set(sigBytes, message.length)
-          raw.set(pubkeyBytes, message.length + sigBytes.length)
+          const simple = rehydrateSimpleTransaction(payload.rawTxHex)
+          // SDK-provided helper: prepends `sha3_256("APTOS::RawTransaction")`
+          // to the BCS-encoded raw tx. KeyringService ed25519-signs the
+          // result; the same helper is what `Account.signTransaction`
+          // uses internally, so the resulting signature verifies.
+          return generateSigningMessageForTransaction(simple)
+        },
+        catch: (cause) =>
+          new FeeEstimationError({
+            chain: String(chainConfig.chainId),
+            cause,
+          }),
+      }),
+
+    attachSignature: (tx, signature, publicKey) =>
+      Effect.try({
+        try: () => {
+          if (signature.length !== 64) {
+            throw new Error(
+              `Aptos ed25519 signature must be 64 bytes, got ${signature.length}`,
+            )
+          }
+          if (publicKey.length !== 32) {
+            throw new Error(
+              `Aptos ed25519 pubkey must be 32 bytes, got ${publicKey.length}`,
+            )
+          }
+          const payload = tx.payload as AptosPayload
+          const rawBytes = hexToBytes(payload.rawTxHex)
+          // Signed Aptos tx blob = [rawTxLen(u32 LE) | rawTxBytes | pubkey(32) | sig(64)]
+          // broadcast() re-decodes this framing to submit via the SDK.
+          const framing = new Uint8Array(4 + rawBytes.length + 32 + 64)
+          let off = 0
+          const len = rawBytes.length
+          framing[off++] = len & 0xff
+          framing[off++] = (len >>> 8) & 0xff
+          framing[off++] = (len >>> 16) & 0xff
+          framing[off++] = (len >>> 24) & 0xff
+          framing.set(rawBytes, off)
+          off += rawBytes.length
+          framing.set(publicKey, off)
+          off += 32
+          framing.set(signature, off)
           const signed: SignedTx = {
             chain: tx.chain,
-            raw,
-            hash: bytesToHex(sigBytes.slice(0, 32)),
+            raw: framing,
+            // Aptos tx hash = sha3_256(signing_message || sig-salt) but
+            // we only need something uniquely identifying for tests and
+            // telemetry; the real on-chain hash comes back from submit.
+            hash: bytesToHex(signature.slice(0, 32)),
             unsigned: tx,
           }
           return signed
         },
-        catch: (e) => e as Error,
-      }).pipe(
-        Effect.catchAll((e) =>
-          Effect.die(new Error(`Aptos sign failed: ${(e as Error).message}`)),
-        ),
-      ),
+        catch: (cause) =>
+          new FeeEstimationError({
+            chain: String(chainConfig.chainId),
+            cause,
+          }),
+      }),
+
+    sign: (tx, privateKey) =>
+      Effect.gen(function* () {
+        // Convenience for adapter-level tests. Sign via @noble/curves
+        // directly so the adapter never stashes the key material.
+        const msg = yield* adapter.buildSigningMessage(tx).pipe(
+          Effect.catchAll((e) =>
+            Effect.die(
+              new Error(`Aptos sign: buildSigningMessage failed: ${e.cause}`),
+            ),
+          ),
+        )
+        const publicKey = ed25519.getPublicKey(privateKey)
+        const signature = ed25519.sign(msg, privateKey)
+        return yield* adapter
+          .attachSignature(tx, signature, publicKey)
+          .pipe(
+            Effect.catchAll((e) =>
+              Effect.die(
+                new Error(`Aptos sign: attachSignature failed: ${e.cause}`),
+              ),
+            ),
+          )
+      }),
 
     broadcast: (signed) =>
       Effect.tryPromise({
         try: async () => {
-          // To actually submit, we need the original SimpleTransaction
-          // object, which the SDK needs for internal serialization.
-          // The unsigned payload holds the BCS-encoded raw tx so we can
-          // reconstruct it via signAndSubmitTransaction() using the
-          // private key stored in the signed bundle. This path is only
-          // reachable when the caller provides a full Aptos client.
-          // For a cleaner signing flow, call
-          // `aptosClient.signAndSubmitTransaction()` directly from app code.
-          throw new Error(
-            "Aptos broadcast requires in-flight rebuilding of SimpleTransaction; call aptosClient.signAndSubmitTransaction() directly for end-to-end flows",
+          // Decode the framing produced by attachSignature.
+          const framing = signed.raw
+          if (framing.length < 4 + 32 + 64) {
+            throw new Error("Aptos signed tx framing is too short")
+          }
+          const len =
+            framing[0]! |
+            (framing[1]! << 8) |
+            (framing[2]! << 16) |
+            (framing[3]! << 24)
+          if (framing.length !== 4 + len + 32 + 64) {
+            throw new Error("Aptos signed tx framing length mismatch")
+          }
+          const rawBytes = framing.slice(4, 4 + len)
+          const pubkeyBytes = framing.slice(4 + len, 4 + len + 32)
+          const sigBytes = framing.slice(4 + len + 32)
+
+          const simple = new SimpleTransaction(
+            RawTransaction.deserialize(new Deserializer(rawBytes)),
           )
+          const authenticator = new AccountAuthenticatorEd25519(
+            new Ed25519PublicKey(pubkeyBytes),
+            new Ed25519Signature(sigBytes),
+          )
+
+          const pending = await aptosClient.transaction.submit.simple({
+            transaction: simple,
+            senderAuthenticator: authenticator,
+          })
+          const hash = pending.hash
+          // Wait for inclusion; SDK helper polls until committed.
+          await aptosClient.waitForTransaction({ transactionHash: hash })
+          return {
+            chain: chainConfig.chainId,
+            hash,
+            status: "confirmed",
+            raw: pending,
+          } satisfies TxReceipt
         },
-        catch: (e) => e as Error,
-      }).pipe(
-        Effect.mapError(
-          (e) =>
-            new BroadcastError({
-              chain: String(chainConfig.chainId),
-              hash: signed.hash,
-              cause: (e as Error).message,
-            }),
-        ),
+        catch: (cause) =>
+          new BroadcastError({
+            chain: String(chainConfig.chainId),
+            hash: signed.hash,
+            cause,
+          }),
+      }),
+
+    buildCctpBurnTx: (_params) =>
+      Effect.fail(
+        new UnsupportedRouteError({
+          from: String(chainConfig.chainId),
+          to: "cctp",
+          asset: "USDC",
+        }),
       ),
 
     getBalance: (address, asset) =>

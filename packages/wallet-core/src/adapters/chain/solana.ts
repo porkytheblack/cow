@@ -1,13 +1,11 @@
 import { Effect } from "effect"
 import {
-  Keypair,
   PublicKey,
   SystemProgram,
   Transaction,
   TransactionInstruction,
 } from "@solana/web3.js"
-import { bytesToHex } from "@noble/hashes/utils"
-import { sha256 } from "@noble/hashes/sha256"
+import { ed25519 } from "@noble/curves/ed25519"
 import { base58Encode, base58Decode } from "../../services/keyring-crypto.js"
 import type { AssetId } from "../../model/asset.js"
 import type { TokenBalance } from "../../model/balance.js"
@@ -18,10 +16,20 @@ import {
   BroadcastError,
   FeeEstimationError,
   UnsupportedChainError,
+  UnsupportedRouteError,
 } from "../../model/errors.js"
 import type { FetchAdapterShape } from "../fetch/index.js"
 import type { ChainAdapter } from "./index.js"
 import { jsonRpcCall } from "./json-rpc.js"
+
+// NOTE: @solana/web3.js v1 is still used here. The architecture guide
+// targets v2 (functional, browser-native, no `Buffer`). A v2 migration
+// requires rewriting the whole transaction/message construction path
+// against `@solana/kit` primitives and is tracked as a follow-up. In
+// the meantime we cast any required `Buffer` handoffs to keep the
+// adapter readable without leaking Node.js types into the public API.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const asBuffer = (bytes: Uint8Array): any => bytes
 
 /**
  * SolanaChainAdapter — routes all RPC through the injected FetchAdapter
@@ -100,7 +108,7 @@ const buildSplTransferIx = (params: {
       { pubkey: params.destination, isSigner: false, isWritable: true },
       { pubkey: params.authority, isSigner: true, isWritable: false },
     ],
-    data: Buffer.from(data),
+    data: asBuffer(data),
   })
 }
 
@@ -141,7 +149,7 @@ const rehydrateTransaction = (payload: SolanaPayload): Transaction => {
           isSigner: k.isSigner,
           isWritable: k.isWritable,
         })),
-        data: Buffer.from(base58Decode(ix.dataBase58)),
+        data: asBuffer(base58Decode(ix.dataBase58)),
       }),
     )
   }
@@ -275,25 +283,90 @@ export const makeSolanaChainAdapter = (
 
     estimateFee: (_tx) => Effect.succeed(5_000n),
 
-    sign: (tx, privateKey) =>
-      Effect.sync(() => {
-        const payload = tx.payload as SolanaPayload
-        // Solana Keypair.fromSeed takes the 32-byte ed25519 seed.
-        const keypair = Keypair.fromSeed(privateKey)
-        const solTx = rehydrateTransaction(payload)
-        solTx.sign(keypair)
-        const raw = new Uint8Array(solTx.serialize({ verifySignatures: true }))
-        // Signature is the first 64 bytes of the serialized tx, base58-encoded.
-        const sig = solTx.signatures[0]?.signature
-        const hash = sig ? base58Encode(new Uint8Array(sig)) : bytesToHex(sha256(raw))
-        const signed: SignedTx = {
-          chain: tx.chain,
-          raw,
-          hash,
-          unsigned: tx,
-        }
-        return signed
+    buildSigningMessage: (tx) =>
+      Effect.try({
+        try: () => {
+          const payload = tx.payload as SolanaPayload
+          const solTx = rehydrateTransaction(payload)
+          // `serializeMessage` returns the message bytes that every
+          // signer ed25519-signs. This is the exact blob KeyringService
+          // must sign for the resulting signature to be valid.
+          return new Uint8Array(solTx.serializeMessage())
+        },
+        catch: (cause) =>
+          new FeeEstimationError({
+            chain: String(chainConfig.chainId),
+            cause,
+          }),
       }),
+
+    attachSignature: (tx, signature, publicKey) =>
+      Effect.try({
+        try: () => {
+          if (signature.length !== 64) {
+            throw new Error(
+              `Solana ed25519 signature must be 64 bytes, got ${signature.length}`,
+            )
+          }
+          if (publicKey.length !== 32) {
+            throw new Error(
+              `Solana ed25519 pubkey must be 32 bytes, got ${publicKey.length}`,
+            )
+          }
+          const payload = tx.payload as SolanaPayload
+          const solTx = rehydrateTransaction(payload)
+          solTx.addSignature(new PublicKey(publicKey), asBuffer(signature))
+          const raw = new Uint8Array(
+            solTx.serialize({ verifySignatures: true }),
+          )
+          const hash = base58Encode(signature)
+          const signed: SignedTx = {
+            chain: tx.chain,
+            raw,
+            hash,
+            unsigned: tx,
+          }
+          return signed
+        },
+        catch: (cause) =>
+          new FeeEstimationError({
+            chain: String(chainConfig.chainId),
+            cause,
+          }),
+      }),
+
+    sign: (tx, privateKey) =>
+      Effect.gen(function* () {
+        // Convenience for adapter-level tests — mirrors the full
+        // buildSigningMessage → ed25519 sign → attachSignature flow.
+        const msg = yield* adapter.buildSigningMessage(tx).pipe(
+          Effect.catchAll((e) =>
+            Effect.die(
+              new Error(`Solana sign: buildSigningMessage failed: ${e.cause}`),
+            ),
+          ),
+        )
+        const publicKey = ed25519.getPublicKey(privateKey)
+        const signature = ed25519.sign(msg, privateKey)
+        return yield* adapter
+          .attachSignature(tx, signature, publicKey)
+          .pipe(
+            Effect.catchAll((e) =>
+              Effect.die(
+                new Error(`Solana sign: attachSignature failed: ${e.cause}`),
+              ),
+            ),
+          )
+      }),
+
+    buildCctpBurnTx: (_params) =>
+      Effect.fail(
+        new UnsupportedRouteError({
+          from: String(chainConfig.chainId),
+          to: "cctp",
+          asset: "USDC",
+        }),
+      ),
 
     broadcast: (signed) =>
       Effect.gen(function* () {

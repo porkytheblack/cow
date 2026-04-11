@@ -7,8 +7,9 @@ import {
   type Address,
   type Hex,
   type TransactionSerializable,
+  type TransactionSerializableEIP1559,
 } from "viem"
-import { privateKeyToAccount } from "viem/accounts"
+import { secp256k1 } from "@noble/curves/secp256k1"
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils"
 import type { AssetId } from "../../model/asset.js"
 import type { TokenBalance } from "../../model/balance.js"
@@ -19,6 +20,7 @@ import {
   BroadcastError,
   FeeEstimationError,
   UnsupportedChainError,
+  UnsupportedRouteError,
 } from "../../model/errors.js"
 import type { FetchAdapterShape } from "../fetch/index.js"
 import type { ChainAdapter } from "./index.js"
@@ -30,8 +32,10 @@ import { jsonRpcCall } from "./json-rpc.js"
  * the injected FetchAdapter. No direct use of `fetch`, no viem `http`
  * transport, no Node polyfills.
  *
- * Signing uses viem's `privateKeyToAccount.signTransaction` which is
- * pure JS (secp256k1 via @noble/curves).
+ * Signing uses `@noble/curves/secp256k1` directly so the adapter can
+ * operate on the signing digest and attach the signature via viem's
+ * `serializeTransaction(tx, sig)` — that way the private key stays in
+ * KeyringService and never reaches the adapter.
  *
  * CCTP V2 support:
  *   - buildTransferTx recognises USDC and builds an ERC20 `transfer`.
@@ -49,8 +53,16 @@ interface EvmCallPayload {
   readonly to: Address
   readonly value: bigint
   readonly data: Hex
-  /** Optional — filled in by estimateFee if not pre-specified. */
+  /**
+   * Filled in by `buildTransferTx` / `buildCctpBurnTx`. EIP-1559 tx:
+   * `maxFeePerGas` + `maxPriorityFeePerGas`. The adapter falls back to
+   * legacy (`gasPrice`) only if the RPC does not support
+   * `eth_maxPriorityFeePerGas`.
+   */
   readonly gas?: bigint
+  readonly maxFeePerGas?: bigint
+  readonly maxPriorityFeePerGas?: bigint
+  /** Present for chains that don't expose EIP-1559 fee history. */
   readonly gasPrice?: bigint
   readonly nonce?: number
   readonly asset?: AssetId
@@ -191,6 +203,122 @@ export const makeEvmChainAdapter = (
       args: [owner],
     })
 
+  const failEst = (cause: unknown): FeeEstimationError =>
+    new FeeEstimationError({ chain: String(chainConfig.chainId), cause })
+
+  /**
+   * Fetch gas, fees and nonce in parallel, preferring EIP-1559 fees
+   * (`eth_maxPriorityFeePerGas` + latest `baseFeePerGas` from
+   * `eth_getBlockByNumber`) and falling back to legacy `eth_gasPrice`
+   * when the RPC does not support the 1559 methods.
+   */
+  const enrichPayloadWithFees = (
+    payload: EvmCallPayload,
+    from: string,
+  ): Effect.Effect<EvmCallPayload, FeeEstimationError> =>
+    Effect.gen(function* () {
+      const estimateGas = rpc<string>("eth_estimateGas", [
+        {
+          from,
+          to: payload.to,
+          value: toHex(payload.value),
+          data: payload.data,
+        },
+      ]).pipe(Effect.catchAll((c) => Effect.fail(failEst(c))))
+
+      const nonceCall = rpc<string>("eth_getTransactionCount", [
+        from,
+        "pending",
+      ]).pipe(Effect.catchAll((c) => Effect.fail(failEst(c))))
+
+      // Try EIP-1559 path: maxPriorityFeePerGas + latest block baseFee.
+      const priorityFeeCall = rpc<string>(
+        "eth_maxPriorityFeePerGas",
+        [],
+      ).pipe(Effect.option)
+      const latestBlockCall = rpc<{ baseFeePerGas?: string } | null>(
+        "eth_getBlockByNumber",
+        ["latest", false],
+      ).pipe(Effect.option)
+
+      const [gasHex, nonceHex, priorityOpt, blockOpt] = yield* Effect.all(
+        [estimateGas, nonceCall, priorityFeeCall, latestBlockCall],
+        { concurrency: "unbounded" },
+      )
+
+      const priorityHex =
+        priorityOpt._tag === "Some" ? priorityOpt.value : undefined
+      const block = blockOpt._tag === "Some" ? blockOpt.value : null
+      const baseFeeHex = block?.baseFeePerGas
+
+      const gas = fromHex(gasHex)
+      const nonce = Number(fromHex(nonceHex))
+
+      if (priorityHex !== undefined && baseFeeHex !== undefined) {
+        const priority = fromHex(priorityHex)
+        const baseFee = fromHex(baseFeeHex)
+        // 2x baseFee is the common "safe max" heuristic used by wallets.
+        const maxFeePerGas = baseFee * 2n + priority
+        return {
+          ...payload,
+          gas,
+          maxFeePerGas,
+          maxPriorityFeePerGas: priority,
+          nonce,
+        } satisfies EvmCallPayload
+      }
+
+      // Legacy fallback.
+      const gasPriceHex = yield* rpc<string>("eth_gasPrice", []).pipe(
+        Effect.catchAll((c) => Effect.fail(failEst(c))),
+      )
+      return {
+        ...payload,
+        gas,
+        gasPrice: fromHex(gasPriceHex),
+        nonce,
+      } satisfies EvmCallPayload
+    })
+
+  /**
+   * Build the viem `TransactionSerializable` object from our payload.
+   * Shared by `buildSigningMessage`, `attachSignature`, and the legacy
+   * `sign()` helper.
+   */
+  const toSerializable = (
+    tx: UnsignedTx,
+  ): TransactionSerializable | undefined => {
+    const payload = tx.payload as EvmCallPayload
+    if (payload.gas === undefined) return undefined
+    if (
+      payload.maxFeePerGas !== undefined &&
+      payload.maxPriorityFeePerGas !== undefined
+    ) {
+      return {
+        to: payload.to,
+        value: payload.value,
+        data: payload.data,
+        chainId: Number(chainIdBig),
+        gas: payload.gas,
+        maxFeePerGas: payload.maxFeePerGas,
+        maxPriorityFeePerGas: payload.maxPriorityFeePerGas,
+        nonce: payload.nonce ?? 0,
+        type: "eip1559",
+      } satisfies TransactionSerializableEIP1559
+    }
+    if (payload.gasPrice === undefined) return undefined
+    return {
+      to: payload.to,
+      value: payload.value,
+      data: payload.data,
+      chainId: Number(chainIdBig),
+      gas: payload.gas,
+      gasPrice: payload.gasPrice,
+      nonce: payload.nonce ?? 0,
+      type: "legacy",
+    }
+  }
+
   const adapter: ChainAdapter = {
     chainId: chainConfig.chainId,
 
@@ -241,64 +369,17 @@ export const makeEvmChainAdapter = (
           }
         }
 
-        // Estimate gas + fetch gas price in parallel.
-        const [gas, gasPrice, nonceHex] = yield* Effect.all(
-          [
-            rpc<string>("eth_estimateGas", [
-              {
-                from,
-                to: payload.to,
-                value: toHex(payload.value),
-                data: payload.data,
-              },
-            ]).pipe(
-              Effect.catchAll((cause) =>
-                Effect.fail(
-                  new FeeEstimationError({
-                    chain: String(chainConfig.chainId),
-                    cause,
-                  }),
-                ),
-              ),
-            ),
-            rpc<string>("eth_gasPrice", []).pipe(
-              Effect.catchAll((cause) =>
-                Effect.fail(
-                  new FeeEstimationError({
-                    chain: String(chainConfig.chainId),
-                    cause,
-                  }),
-                ),
-              ),
-            ),
-            rpc<string>("eth_getTransactionCount", [from, "pending"]).pipe(
-              Effect.catchAll((cause) =>
-                Effect.fail(
-                  new FeeEstimationError({
-                    chain: String(chainConfig.chainId),
-                    cause,
-                  }),
-                ),
-              ),
-            ),
-          ],
-          { concurrency: "unbounded" },
-        )
-
-        const finalGas = fromHex(gas)
-        const finalGasPrice = fromHex(gasPrice)
-        const nonce = Number(fromHex(nonceHex))
+        const enriched = yield* enrichPayloadWithFees(payload, from)
+        const totalFee =
+          enriched.maxFeePerGas !== undefined
+            ? enriched.gas! * enriched.maxFeePerGas
+            : enriched.gas! * (enriched.gasPrice ?? 0n)
 
         const tx: UnsignedTx = {
           chain: chainConfig.chainId,
           from,
-          payload: {
-            ...payload,
-            gas: finalGas,
-            gasPrice: finalGasPrice,
-            nonce,
-          } satisfies EvmCallPayload,
-          estimatedFee: finalGas * finalGasPrice,
+          payload: enriched,
+          estimatedFee: totalFee,
           metadata: {
             intent: `Transfer ${amount} ${asset.symbol} to ${to}`,
             createdAt: Date.now(),
@@ -310,78 +391,138 @@ export const makeEvmChainAdapter = (
     estimateFee: (tx) =>
       Effect.gen(function* () {
         const payload = tx.payload as EvmCallPayload
+        if (
+          payload.gas !== undefined &&
+          payload.maxFeePerGas !== undefined
+        ) {
+          return payload.gas * payload.maxFeePerGas
+        }
         if (payload.gas !== undefined && payload.gasPrice !== undefined) {
           return payload.gas * payload.gasPrice
         }
-        const gasHex = yield* rpc<string>("eth_estimateGas", [
-          {
-            from: tx.from,
-            to: payload.to,
-            value: toHex(payload.value),
-            data: payload.data,
-          },
-        ]).pipe(
-          Effect.catchAll((cause) =>
-            Effect.fail(
-              new FeeEstimationError({
-                chain: String(chainConfig.chainId),
-                cause,
-              }),
+        const enriched = yield* enrichPayloadWithFees(payload, tx.from)
+        if (enriched.maxFeePerGas !== undefined) {
+          return enriched.gas! * enriched.maxFeePerGas
+        }
+        return enriched.gas! * (enriched.gasPrice ?? 0n)
+      }),
+
+    buildSigningMessage: (tx) =>
+      Effect.gen(function* () {
+        const serializable = toSerializable(tx)
+        if (!serializable) {
+          return yield* Effect.fail(
+            failEst(
+              "EVM buildSigningMessage requires a payload with gas + fee fields",
             ),
-          ),
-        )
-        const gasPriceHex = yield* rpc<string>("eth_gasPrice", []).pipe(
-          Effect.catchAll((cause) =>
-            Effect.fail(
-              new FeeEstimationError({
-                chain: String(chainConfig.chainId),
-                cause,
-              }),
+          )
+        }
+        // Digest that secp256k1 must sign: keccak256 of the unsigned
+        // serialized tx, per EIP-155 / EIP-1559.
+        const unsignedHex = serializeTransaction(serializable)
+        const digestHex = keccak256(unsignedHex)
+        return hexToBytes(digestHex.slice(2))
+      }),
+
+    attachSignature: (tx, signature, _publicKey) =>
+      Effect.gen(function* () {
+        const serializable = toSerializable(tx)
+        if (!serializable) {
+          return yield* Effect.fail(
+            failEst(
+              "EVM attachSignature requires a payload with gas + fee fields",
             ),
-          ),
-        )
-        return fromHex(gasHex) * fromHex(gasPriceHex)
+          )
+        }
+        if (signature.length !== 65) {
+          return yield* Effect.fail(
+            failEst(
+              `EVM signature must be 65 bytes (r||s||v), got ${signature.length}`,
+            ),
+          )
+        }
+        const r = `0x${bytesToHex(signature.slice(0, 32))}` as Hex
+        const s = `0x${bytesToHex(signature.slice(32, 64))}` as Hex
+        const recovery = signature[64] === 1 ? 1 : 0
+        // EIP-1559 wants yParity (0 or 1); legacy wants EIP-155 v =
+        // chainId*2 + 35 + recovery.
+        let signedHex: Hex
+        if (serializable.type === "eip1559") {
+          signedHex = serializeTransaction(serializable, {
+            r,
+            s,
+            yParity: recovery as 0 | 1,
+          })
+        } else {
+          const v = BigInt(recovery) + chainIdBig * 2n + 35n
+          signedHex = serializeTransaction(serializable, { r, s, v })
+        }
+        const hash = keccak256(signedHex)
+        const raw = hexToBytes(signedHex.slice(2))
+        const signed: SignedTx = {
+          chain: tx.chain,
+          raw,
+          hash,
+          unsigned: tx,
+        }
+        return signed
       }),
 
     sign: (tx, privateKey) =>
-      Effect.tryPromise({
-        try: async () => {
-          const payload = tx.payload as EvmCallPayload
-          if (payload.gas === undefined || payload.gasPrice === undefined) {
-            throw new Error(
-              "EVM sign requires a payload with gas + gasPrice — call estimateFee first",
-            )
-          }
-          const account = privateKeyToAccount(
-            `0x${bytesToHex(privateKey)}` as Hex,
+      Effect.gen(function* () {
+        // Convenience — used only by adapter-level unit tests. The
+        // production path goes through SignerService + KeyringService.
+        const digest = yield* adapter.buildSigningMessage(tx).pipe(
+          Effect.catchAll((e) =>
+            Effect.die(
+              new Error(`EVM sign: buildSigningMessage failed: ${e.cause}`),
+            ),
+          ),
+        )
+        const sig = secp256k1.sign(digest, privateKey)
+        const sigBytes = new Uint8Array(65)
+        sigBytes.set(sig.toCompactRawBytes(), 0)
+        sigBytes[64] = sig.recovery ?? 0
+        return yield* adapter
+          .attachSignature(tx, sigBytes, new Uint8Array(0))
+          .pipe(
+            Effect.catchAll((e) =>
+              Effect.die(
+                new Error(`EVM sign: attachSignature failed: ${e.cause}`),
+              ),
+            ),
           )
-          const serializable: TransactionSerializable = {
-            to: payload.to,
-            value: payload.value,
-            data: payload.data,
-            chainId: Number(chainIdBig),
-            gas: payload.gas,
-            gasPrice: payload.gasPrice,
-            nonce: payload.nonce ?? 0,
-            type: "legacy",
-          }
-          const signedHex = await account.signTransaction(serializable)
-          const hash = keccak256(signedHex)
-          const raw = hexToBytes(signedHex.slice(2))
-          const signed: SignedTx = {
-            chain: tx.chain,
-            raw,
-            hash,
-            unsigned: tx,
-          }
-          return signed
-        },
-        catch: (e) => e as Error,
-      }).pipe(
-        Effect.catchAll((e) =>
-          Effect.die(new Error(`EVM sign failed: ${(e as Error).message}`)),
-        ),
-      ),
+      }),
+
+    buildCctpBurnTx: ({ from, destinationDomain, recipient, amount }) =>
+      Effect.gen(function* () {
+        if (!cctpContracts) {
+          return yield* Effect.fail(
+            new UnsupportedRouteError({
+              from: String(chainConfig.chainId),
+              to: `cctp:${destinationDomain}`,
+              asset: "USDC",
+            }),
+          )
+        }
+        const initial = buildEvmCctpBurnTx(chainConfig, cctpContracts, {
+          from,
+          recipient: toAddress(recipient),
+          amount,
+          destinationDomain,
+        })
+        const basePayload = initial.payload as EvmCallPayload
+        const enriched = yield* enrichPayloadWithFees(basePayload, from)
+        const totalFee =
+          enriched.maxFeePerGas !== undefined
+            ? enriched.gas! * enriched.maxFeePerGas
+            : enriched.gas! * (enriched.gasPrice ?? 0n)
+        return {
+          ...initial,
+          payload: enriched,
+          estimatedFee: totalFee,
+        } satisfies UnsignedTx
+      }),
 
     broadcast: (signed) =>
       Effect.gen(function* () {

@@ -6,6 +6,7 @@ import type { SignedTx, UnsignedTx } from "../model/transaction.js"
 import {
   AuthDeniedError,
   AuthTimeoutError,
+  FeeEstimationError,
   KeyNotFoundError,
   StorageError,
   UnsupportedChainError,
@@ -15,8 +16,14 @@ import { KeyringService } from "./keyring.js"
 
 export interface SignerServiceShape {
   /**
-   * Request auth, pull the chain-specific private key from the keyring,
-   * delegate signing to the chain adapter, and return the signed tx.
+   * Request auth and sign via the keyring-owned private key, never
+   * exposing the key outside KeyringService. The flow is:
+   *
+   *   1. Get approval from the AuthGate.
+   *   2. Ask the ChainAdapter for the curve-specific signing bytes.
+   *   3. Hand those bytes + approval to KeyringService.signBytes,
+   *      which signs internally and returns only the signature.
+   *   4. Ask the ChainAdapter to wrap the signature into a full SignedTx.
    */
   readonly sign: (
     tx: UnsignedTx,
@@ -26,6 +33,7 @@ export interface SignerServiceShape {
     | AuthDeniedError
     | AuthTimeoutError
     | UnsupportedChainError
+    | FeeEstimationError
     | StorageError,
     | KeyringService
     | AuthGateService
@@ -40,8 +48,6 @@ export class SignerService extends Context.Tag("SignerService")<
   SignerServiceShape
 >() {}
 
-const textEncoder = new TextEncoder()
-
 export const SignerServiceLive = Layer.succeed(SignerService, {
   sign: (tx: UnsignedTx) =>
     Effect.gen(function* () {
@@ -50,6 +56,9 @@ export const SignerServiceLive = Layer.succeed(SignerService, {
       const registry = yield* ChainAdapterRegistry
       const configService = yield* WalletConfigService
 
+      // The config's `elevatedThreshold` is compared against the tx's
+      // estimated fee. UnsignedTx has no intrinsic "value" field, so
+      // fee is the closest proxy for "is this a big transaction?".
       const elevatedThreshold = configService.config.auth.elevatedThreshold
       const level: "standard" | "elevated" =
         tx.estimatedFee !== undefined && tx.estimatedFee >= elevatedThreshold
@@ -63,15 +72,21 @@ export const SignerServiceLive = Layer.succeed(SignerService, {
 
       const adapter = yield* registry.get(tx.chain)
 
-      // signBytes verifies the approval and returns the raw private key
-      // bytes. The key lives only for the duration of this effect.
-      const privateKey = yield* keyring.signBytes(
-        tx.chain,
-        textEncoder.encode(JSON.stringify(tx.payload)),
-        approval,
-      )
+      // 1. Ask the adapter what bytes to sign over.
+      const message = yield* adapter.buildSigningMessage(tx)
 
-      const signed = yield* adapter.sign(tx, privateKey)
+      // 2. Ask the keyring for the public key metadata and the signature.
+      //    The private key never leaves KeyringService.
+      const derivedKey = yield* keyring.getKey(tx.chain)
+      const signature = yield* keyring.signBytes(tx.chain, message, approval)
+
+      // 3. Hand the signature + public key back to the adapter to assemble
+      //    the broadcast-ready SignedTx.
+      const signed = yield* adapter.attachSignature(
+        tx,
+        signature,
+        derivedKey.publicKey,
+      )
       return signed
     }),
 })

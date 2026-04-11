@@ -19,6 +19,16 @@ export interface CctpConfig {
 }
 
 export interface AuthConfig {
+  /**
+   * Transactions whose `estimatedFee` is at or above this threshold are
+   * treated as "elevated" and force a passkey-grade approval from
+   * `AuthGateService`. Measured in the tx's native fee unit (wei on
+   * EVM, lamports on Solana, octas on Aptos) — callers pick a scheme
+   * that works for their fee markets. The spec originally called this
+   * a "value" threshold, but `UnsignedTx` has no intrinsic value field
+   * and the fee is the closest proxy the library can compute for all
+   * three curves uniformly.
+   */
   readonly elevatedThreshold: bigint
   readonly sessionTtlMs: number
   readonly pinMinLength: number

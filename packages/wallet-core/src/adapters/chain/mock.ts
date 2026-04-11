@@ -4,11 +4,14 @@ import { sha256 } from "@noble/hashes/sha256"
 import type { AssetId } from "../../model/asset.js"
 import type { TokenBalance } from "../../model/balance.js"
 import type { BurnMessage } from "../../model/cctp.js"
-import type { ChainConfig, ChainId } from "../../model/chain.js"
+import type { ChainConfig } from "../../model/chain.js"
 import type { SignedTx, TxReceipt, UnsignedTx } from "../../model/transaction.js"
-import { isUsdc } from "../../model/asset.js"
 import { BroadcastError } from "../../model/errors.js"
 import type { ChainAdapter } from "./index.js"
+import {
+  publicKeyForChain,
+  signMessageForChain,
+} from "../../services/keyring-crypto.js"
 
 interface MockState {
   readonly balances: Map<string, bigint> // key: `${address}::${symbol}`
@@ -84,7 +87,7 @@ export const makeMockChainAdapter = (config: ChainConfig): ChainAdapter => {
           to?: string
           asset?: AssetId
           amount?: string
-          destChain?: ChainId
+          destDomain?: number
           recipient?: string
         }
 
@@ -149,31 +152,86 @@ export const makeMockChainAdapter = (config: ChainConfig): ChainAdapter => {
         return out
       }),
 
-    sign: (tx, privateKey) =>
+    // The mock hashes the payload to a fixed 32-byte digest so the
+    // same message can be signed by either ed25519 or secp256k1
+    // (secp256k1 requires a 32-byte input); this mirrors what a real
+    // chain adapter would do with its chain-specific digest.
+    buildSigningMessage: (tx) =>
+      Effect.sync(() =>
+        sha256(new TextEncoder().encode(JSON.stringify(tx.payload))),
+      ),
+
+    attachSignature: (tx, signature, publicKey) =>
       Effect.sync(() => {
-        // Deterministic synthetic signature: hash(payload || privateKey)
         const payloadBytes = new TextEncoder().encode(JSON.stringify(tx.payload))
-        const combined = new Uint8Array(payloadBytes.length + privateKey.length)
-        combined.set(payloadBytes, 0)
-        combined.set(privateKey, payloadBytes.length)
-        const sig = sha256(combined)
-        const raw = new Uint8Array(payloadBytes.length + sig.length)
+        const raw = new Uint8Array(
+          payloadBytes.length + signature.length + publicKey.length,
+        )
         raw.set(payloadBytes, 0)
-        raw.set(sig, payloadBytes.length)
-        const hash = hashOf(raw)
+        raw.set(signature, payloadBytes.length)
+        raw.set(publicKey, payloadBytes.length + signature.length)
         return {
           chain: tx.chain,
           raw,
-          hash,
+          hash: hashOf(raw),
           unsigned: tx,
         }
+      }),
+
+    sign: (tx, privateKey) =>
+      Effect.sync(() => {
+        // Convenience for adapter-level tests only — mirrors the
+        // three-step buildSigningMessage / sign / attachSignature flow
+        // that SignerService uses in production.
+        const digest = sha256(
+          new TextEncoder().encode(JSON.stringify(tx.payload)),
+        )
+        const signature = signMessageForChain(
+          String(tx.chain),
+          digest,
+          privateKey,
+        )
+        const publicKey = publicKeyForChain(String(tx.chain), privateKey)
+        const payloadBytes = new TextEncoder().encode(JSON.stringify(tx.payload))
+        const raw = new Uint8Array(
+          payloadBytes.length + signature.length + publicKey.length,
+        )
+        raw.set(payloadBytes, 0)
+        raw.set(signature, payloadBytes.length)
+        raw.set(publicKey, payloadBytes.length + signature.length)
+        return {
+          chain: tx.chain,
+          raw,
+          hash: hashOf(raw),
+          unsigned: tx,
+        }
+      }),
+
+    buildCctpBurnTx: ({ from, destinationDomain, recipient, amount }) =>
+      Effect.sync(() => {
+        const tx: UnsignedTx = {
+          chain: config.chainId,
+          from,
+          payload: {
+            kind: "cctp-burn",
+            destDomain: destinationDomain,
+            amount: amount.toString(),
+            recipient,
+          },
+          estimatedFee: 2_000n,
+          metadata: {
+            intent: `CCTP burn ${amount} USDC (domain ${destinationDomain})`,
+            createdAt: Date.now(),
+          },
+        }
+        return tx
       }),
 
     extractBurnMessage: (receipt) =>
       Effect.sync(() => {
         const payload = receipt.raw as {
           kind: string
-          destChain?: ChainId
+          destDomain?: number
           amount?: string
           recipient?: string
         }
@@ -187,7 +245,7 @@ export const makeMockChainAdapter = (config: ChainConfig): ChainAdapter => {
         const messageBytes = new TextEncoder().encode(
           JSON.stringify({
             src: config.chainId,
-            dst: payload.destChain,
+            dstDomain: payload.destDomain,
             amount: payload.amount,
             recipient: payload.recipient,
             burnTxHash: receipt.hash,
@@ -196,7 +254,7 @@ export const makeMockChainAdapter = (config: ChainConfig): ChainAdapter => {
         const messageHash = bytesToHex(sha256(messageBytes))
         const burn: BurnMessage = {
           sourceDomain: config.cctpDomain ?? 0,
-          destDomain: 0, // filled by caller as needed
+          destDomain: payload.destDomain ?? 0,
           nonce: BigInt("0x" + messageHash.slice(0, 16)),
           burnTxHash: receipt.hash,
           messageBytes,

@@ -75,13 +75,14 @@ describe("EvmChainAdapter", () => {
     expect(addr).toMatch(/^0x[0-9a-f]{40}$/)
   })
 
-  it("builds a native ETH transfer and queries gas + nonce via JSON-RPC", async () => {
+  it("builds a native ETH transfer via EIP-1559 JSON-RPC", async () => {
     const captured: { method: string; params: unknown }[] = []
     const fetchLayer = mockRpc(
       {
         eth_estimateGas: "0x5208",
-        eth_gasPrice: "0x3b9aca00", // 1 gwei
         eth_getTransactionCount: "0x5",
+        eth_maxPriorityFeePerGas: "0x3b9aca00", // 1 gwei tip
+        eth_getBlockByNumber: { baseFeePerGas: "0x3b9aca00" }, // 1 gwei base
       },
       captured,
     )
@@ -97,11 +98,44 @@ describe("EvmChainAdapter", () => {
     })
     const tx = await Effect.runPromise(Effect.provide(program, fetchLayer))
     expect(tx.chain).toBe("evm:1")
-    expect(tx.estimatedFee).toBe(21_000n * 1_000_000_000n)
+    // maxFeePerGas = 2 * baseFee + priority = 3 gwei; gas = 21000
+    expect(tx.estimatedFee).toBe(21_000n * 3_000_000_000n)
     const methodsCalled = captured.map((c) => c.method).sort()
     expect(methodsCalled).toEqual(
-      ["eth_estimateGas", "eth_gasPrice", "eth_getTransactionCount"].sort(),
+      [
+        "eth_estimateGas",
+        "eth_getBlockByNumber",
+        "eth_getTransactionCount",
+        "eth_maxPriorityFeePerGas",
+      ].sort(),
     )
+  })
+
+  it("falls back to legacy gas price when EIP-1559 RPCs are unavailable", async () => {
+    const captured: { method: string; params: unknown }[] = []
+    const fetchLayer = mockRpc(
+      {
+        eth_estimateGas: "0x5208",
+        eth_getTransactionCount: "0x0",
+        eth_gasPrice: "0x3b9aca00",
+        // no eth_maxPriorityFeePerGas, no eth_getBlockByNumber
+      },
+      captured,
+    )
+    const program = Effect.gen(function* () {
+      const fetcher = yield* FetchAdapter
+      const adapter = makeEvmChainAdapter({ chainConfig: evmChain, fetcher })
+      return yield* adapter.buildTransferTx({
+        from: "0x1111111111111111111111111111111111111111",
+        to: "0x2222222222222222222222222222222222222222",
+        asset: evmChain.nativeAsset,
+        amount: 1_000_000_000_000_000_000n,
+      })
+    })
+    const tx = await Effect.runPromise(Effect.provide(program, fetchLayer))
+    expect(tx.estimatedFee).toBe(21_000n * 1_000_000_000n)
+    const methodsCalled = captured.map((c) => c.method).sort()
+    expect(methodsCalled).toContain("eth_gasPrice")
   })
 
   it("builds an ERC20 transfer with encoded calldata", async () => {
@@ -111,6 +145,8 @@ describe("EvmChainAdapter", () => {
         eth_estimateGas: "0xea60",
         eth_gasPrice: "0x3b9aca00",
         eth_getTransactionCount: "0x0",
+        eth_maxPriorityFeePerGas: "0x3b9aca00",
+        eth_getBlockByNumber: { baseFeePerGas: "0x3b9aca00" },
       },
       captured,
     )
@@ -140,6 +176,8 @@ describe("EvmChainAdapter", () => {
         eth_estimateGas: "0x5208",
         eth_gasPrice: "0x3b9aca00",
         eth_getTransactionCount: "0x0",
+        eth_maxPriorityFeePerGas: "0x3b9aca00",
+        eth_getBlockByNumber: { baseFeePerGas: "0x3b9aca00" },
       },
       captured,
     )
