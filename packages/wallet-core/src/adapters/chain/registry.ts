@@ -105,9 +105,15 @@ export const ChainAdapterRegistryLive = Layer.effect(
  * Build a registry layer with full Aptos support. Consumers provide a
  * pre-configured `Aptos` client per Aptos chain id — the adapter delegates
  * all HTTP to that client.
+ *
+ * `sponsoredChains` marks Aptos chain ids whose adapter should be built in
+ * sponsored (gas-station) mode. The matching `Aptos` client MUST have been
+ * constructed with a `GasStationTransactionSubmitter` wired into
+ * `pluginSettings.TRANSACTION_SUBMITTER`; see `AptosAdapterOptions.sponsored`.
  */
 export const makeAptosAwareRegistryLive = (
   aptosClients: ReadonlyMap<ChainId, Aptos>,
+  sponsoredChains?: ReadonlySet<ChainId>,
 ): Layer.Layer<
   ChainAdapterRegistry,
   never,
@@ -155,7 +161,11 @@ export const makeAptosAwareRegistryLive = (
             }
             adapters.set(
               chain.chainId,
-              makeAptosChainAdapter({ chainConfig: chain, aptosClient: client }),
+              makeAptosChainAdapter({
+                chainConfig: chain,
+                aptosClient: client,
+                sponsored: sponsoredChains?.has(chain.chainId) ?? false,
+              }),
             )
             break
           }
