@@ -74,12 +74,32 @@ export interface AptosAdapterOptions {
   readonly aptosClient: Aptos
   /** Override the USDC fungible asset metadata address. */
   readonly usdcMetadataAddress?: string
+  /**
+   * When true, every tx this adapter builds is treated as sponsored:
+   *
+   *   - `buildTransferTx` and `buildMintTx` pass `withFeePayer: true` to
+   *     `aptosClient.transaction.build.simple(...)`, producing a
+   *     `RawTransactionWithData::MultiAgentWithFeePayer` shape.
+   *   - `UnsignedTx.estimatedFee` is 0n, so `SignerService` will not
+   *     escalate the auth prompt via `elevatedThreshold`.
+   *   - `broadcast` routes through the plugin on `aptosClient` (see below).
+   *
+   * The caller MUST have constructed `aptosClient` with a
+   * `GasStationTransactionSubmitter` wired into
+   * `pluginSettings.TRANSACTION_SUBMITTER` (see @aptos-labs/gas-station-client).
+   *
+   * If `sponsored: true` is set without the plugin, submission will fail at
+   * the fullnode with `INVALID_SIGNATURE` or a missing-fee-payer error.
+   * cow-wallet cannot detect this misconfiguration from its side.
+   */
+  readonly sponsored?: boolean
 }
 
 export const makeAptosChainAdapter = (
   opts: AptosAdapterOptions,
 ): ChainAdapter => {
   const { chainConfig, aptosClient, usdcMetadataAddress } = opts
+  const sponsored = opts.sponsored ?? false
   const usdcAddress = usdcMetadataAddress ?? DEFAULT_APTOS_USDC_METADATA
 
   const buildTransactionForIntent = async (params: {
@@ -92,6 +112,10 @@ export const makeAptosChainAdapter = (
     if (params.asset.type === "native") {
       return aptosClient.transaction.build.simple({
         sender: senderAddr,
+        // Sender signs with `fee_payer_address = 0x0` (framework 1.8+
+        // wildcard). The gas-station plugin fills in the real fee-payer
+        // at submit time; don't pre-fill one here.
+        withFeePayer: sponsored,
         data: {
           function: "0x1::aptos_account::transfer_coins",
           typeArguments: ["0x1::aptos_coin::AptosCoin"],
@@ -103,6 +127,7 @@ export const makeAptosChainAdapter = (
     const metadata = params.asset.address ?? usdcAddress
     return aptosClient.transaction.build.simple({
       sender: senderAddr,
+      withFeePayer: sponsored,
       data: {
         function: "0x1::primary_fungible_store::transfer",
         typeArguments: ["0x1::fungible_asset::Metadata"],
@@ -152,7 +177,9 @@ export const makeAptosChainAdapter = (
             chain: chainConfig.chainId,
             from: params.from,
             payload,
-            estimatedFee: 2_000n,
+            // Zero when sponsored so SignerService doesn't compare a real
+            // fee against `auth.elevatedThreshold` — the user isn't paying.
+            estimatedFee: sponsored ? 0n : 2_000n,
             metadata: {
               intent: `Transfer ${params.amount} ${params.asset.symbol} to ${params.to}`,
               createdAt: Date.now(),
@@ -167,7 +194,7 @@ export const makeAptosChainAdapter = (
           }),
       }),
 
-    estimateFee: (_tx) => Effect.succeed(2_000n),
+    estimateFee: (_tx) => Effect.succeed(sponsored ? 0n : 2_000n),
 
     buildSigningMessage: (tx) =>
       Effect.try({
@@ -202,10 +229,13 @@ export const makeAptosChainAdapter = (
           }
           const payload = tx.payload as AptosPayload
           const rawBytes = hexToBytes(payload.rawTxHex)
-          // Signed Aptos tx blob = [rawTxLen(u32 LE) | rawTxBytes | pubkey(32) | sig(64)]
-          // broadcast() re-decodes this framing to submit via the SDK.
-          const framing = new Uint8Array(4 + rawBytes.length + 32 + 64)
+          // Signed Aptos tx blob = [tag(1) | rawTxLen(u32 LE) | rawTxBytes | pubkey(32) | sig(64)]
+          // tag: 0x00 = unsponsored, 0x01 = sponsored. broadcast() reads
+          // the tag so a sponsored blob accidentally submitted without
+          // the plugin fails loudly instead of silently.
+          const framing = new Uint8Array(1 + 4 + rawBytes.length + 32 + 64)
           let off = 0
+          framing[off++] = sponsored ? 0x01 : 0x00
           const len = rawBytes.length
           framing[off++] = len & 0xff
           framing[off++] = (len >>> 8) & 0xff
@@ -261,22 +291,32 @@ export const makeAptosChainAdapter = (
     broadcast: (signed) =>
       Effect.tryPromise({
         try: async () => {
-          // Decode the framing produced by attachSignature.
+          // Decode the framing produced by attachSignature:
+          //   [tag(1) | rawTxLen(u32 LE) | rawTxBytes | pubkey(32) | sig(64)]
           const framing = signed.raw
-          if (framing.length < 4 + 32 + 64) {
+          if (framing.length < 1) {
+            throw new Error("Aptos signed tx framing is empty")
+          }
+          const tag = framing[0]!
+          if (tag !== 0x00 && tag !== 0x01) {
+            throw new Error(
+              `unknown Aptos framing tag: 0x${tag.toString(16)}`,
+            )
+          }
+          if (framing.length < 1 + 4 + 32 + 64) {
             throw new Error("Aptos signed tx framing is too short")
           }
           const len =
-            framing[0]! |
-            (framing[1]! << 8) |
-            (framing[2]! << 16) |
-            (framing[3]! << 24)
-          if (framing.length !== 4 + len + 32 + 64) {
+            framing[1]! |
+            (framing[2]! << 8) |
+            (framing[3]! << 16) |
+            (framing[4]! << 24)
+          if (framing.length !== 1 + 4 + len + 32 + 64) {
             throw new Error("Aptos signed tx framing length mismatch")
           }
-          const rawBytes = framing.slice(4, 4 + len)
-          const pubkeyBytes = framing.slice(4 + len, 4 + len + 32)
-          const sigBytes = framing.slice(4 + len + 32)
+          const rawBytes = framing.slice(5, 5 + len)
+          const pubkeyBytes = framing.slice(5 + len, 5 + len + 32)
+          const sigBytes = framing.slice(5 + len + 32)
 
           const simple = new SimpleTransaction(
             RawTransaction.deserialize(new Deserializer(rawBytes)),
@@ -286,12 +326,20 @@ export const makeAptosChainAdapter = (
             new Ed25519Signature(sigBytes),
           )
 
+          // Sponsored vs unsponsored submit: the call shape is identical.
+          // What differs is whether `aptosClient.config.pluginSettings
+          // .TRANSACTION_SUBMITTER` is set. When it is, the plugin
+          // intercepts submission, signs as fee payer, and combines
+          // authenticators. cow-wallet never constructs a
+          // feePayerAuthenticator and never passes one here.
           const pending = await aptosClient.transaction.submit.simple({
             transaction: simple,
             senderAuthenticator: authenticator,
           })
           const hash = pending.hash
           // Wait for inclusion; SDK helper polls until committed.
+          // Keep this inside the try block so gas-station policy
+          // rejections surface through BroadcastError.cause.
           await aptosClient.waitForTransaction({ transactionHash: hash })
           return {
             chain: chainConfig.chainId,
@@ -406,6 +454,7 @@ export const makeAptosChainAdapter = (
           const senderAddr = AccountAddress.fromString(recipient)
           const txn = await aptosClient.transaction.build.simple({
             sender: senderAddr,
+            withFeePayer: sponsored,
             data: {
               function: "0x0::cctp_message_transmitter::receive_message",
               functionArguments: [
@@ -424,7 +473,7 @@ export const makeAptosChainAdapter = (
             chain: chainConfig.chainId,
             from: recipient,
             payload,
-            estimatedFee: 2_000n,
+            estimatedFee: sponsored ? 0n : 2_000n,
             metadata: {
               intent: "CCTP mint on Aptos",
               createdAt: Date.now(),

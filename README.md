@@ -421,6 +421,66 @@ const wallet = createWalletClient(config, {
 })
 ```
 
+#### Gas Station (sponsored Aptos transactions)
+
+Aptos transfers can be sponsored via [Geomi Gas Station](https://geomi.dev): the user signs, but gas is billed to a fee payer operated by Aptos Labs' managed service. cow-wallet doesn't hold fee-payer keys — the sponsorship happens inside the Aptos SDK's `TRANSACTION_SUBMITTER` plugin, which you wire into the `Aptos` client.
+
+Install the peer dependency:
+
+```
+pnpm add @aptos-labs/gas-station-client
+```
+
+Wire the plugin into the `Aptos` client and flag Aptos as sponsored in the registry:
+
+```typescript
+import { Aptos, AptosConfig, Network } from "@aptos-labs/ts-sdk"
+import {
+  GasStationClient,
+  GasStationTransactionSubmitter,
+} from "@aptos-labs/gas-station-client"
+import { createWalletClient, makeAptosAwareRegistryLive } from "cow-wallet"
+
+// 1. Construct the gas station client + plugin.
+const gasStation = new GasStationClient({
+  network: Network.MAINNET,
+  apiKey: process.env.APTOS_GAS_STATION_API_KEY!,
+})
+
+// 2. Construct the Aptos client with the plugin wired in.
+const aptos = new Aptos(
+  new AptosConfig({
+    network: Network.MAINNET,
+    pluginSettings: {
+      TRANSACTION_SUBMITTER: new GasStationTransactionSubmitter(gasStation),
+    },
+  }),
+)
+
+// 3. Construct the wallet, flagging Aptos as sponsored.
+const wallet = createWalletClient(config, {
+  chainRegistry: makeAptosAwareRegistryLive(
+    new Map([["aptos", aptos]]),
+    new Set(["aptos"]),
+  ),
+})
+
+// 4. Transfers on Aptos are now gasless for the user.
+await wallet.transfer({
+  from: { chain: "aptos", address: srcAddr },
+  to: { chain: "aptos", address: recipient },
+  asset: usdcAptos,
+  amount: 1_000_000n,
+})
+```
+
+Notes:
+
+- The gas station `network` and `apiKey` MUST match the `AptosConfig` `network`. A testnet key against a mainnet config fails at submit with a cryptic error.
+- Gas stations enforce policy (whitelisted Move functions, per-sender rate limits, per-function gas caps). Policy rejections surface as `BroadcastError` with the provider's message preserved unwrapped on `cause`.
+- If you set `sponsored` in the registry but forget the plugin on the `Aptos` client, submission fails at the fullnode with `INVALID_SIGNATURE`. cow-wallet can't detect that misconfiguration on its side.
+- Sponsored support is Aptos-only. EVM paymasters (ERC-4337) and Solana fee payers are separate designs, not implemented here.
+
 ## Architecture
 
 ```

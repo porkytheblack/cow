@@ -65,5 +65,13 @@
     "tsup": "^8.5.1",
     "typescript": "^5.6.0",
     "vitest": "^3.0.0"
+  },
+  "peerDependencies": {
+    "@aptos-labs/gas-station-client": "^2.0.3"
+  },
+  "peerDependenciesMeta": {
+    "@aptos-labs/gas-station-client": {
+      "optional": true
+    }
   }
 }
