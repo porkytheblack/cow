@@ -95,3 +95,6 @@ export {
 
 // Factory
 export { createWallet, type WalletAdapterOverrides, type WalletLayer } from "./create-wallet.js"
+
+// Promise-based client (no Effect knowledge required)
+export { createWalletClient, type WalletClient } from "./client.js"
