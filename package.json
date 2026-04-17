@@ -2,8 +2,9 @@
   "name": "cow-workspace",
   "private": true,
   "scripts": {
-    "test": "pnpm --filter @wallet/core test",
-    "typecheck": "pnpm --filter @wallet/core typecheck"
+    "build": "pnpm --filter cow-wallet build",
+    "test": "pnpm --filter cow-wallet test",
+    "typecheck": "pnpm --filter cow-wallet typecheck"
   },
   "packageManager": "pnpm@10.33.0"
 }
