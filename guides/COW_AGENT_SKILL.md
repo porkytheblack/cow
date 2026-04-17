@@ -9,8 +9,8 @@ COW is a multichain wallet TypeScript library at `packages/wallet-core`. It supp
 ### 1. Promise API (recommended for app code)
 
 ```typescript
-import { createWalletClient } from "@wallet/core/client"
-// or: import { createWalletClient } from "@wallet/core"
+import { createWalletClient } from "cow-wallet/client"
+// or: import { createWalletClient } from "cow-wallet"
 
 const wallet = createWalletClient(config)
 const { mnemonic, keys } = await wallet.generate()
@@ -19,7 +19,7 @@ const { mnemonic, keys } = await wallet.generate()
 ### 2. Effect API (for advanced composition, testing, custom layers)
 
 ```typescript
-import { createWallet, KeyringService, TransferService } from "@wallet/core"
+import { createWallet, KeyringService, TransferService } from "cow-wallet"
 import { Effect } from "effect"
 
 const layer = createWallet(config)
@@ -37,7 +37,7 @@ await Effect.runPromise(Effect.provide(program, layer))
 Every wallet starts with a config. This is the minimum viable shape:
 
 ```typescript
-import type { WalletConfig } from "@wallet/core"
+import type { WalletConfig } from "cow-wallet"
 
 const config: WalletConfig = {
   chains: [
@@ -308,7 +308,7 @@ try {
 Default: auto-approves everything (dev only). Override for production:
 
 ```typescript
-import { createWalletClient, makeCallbackAuthGate } from "@wallet/core"
+import { createWalletClient, makeCallbackAuthGate } from "cow-wallet"
 
 createWalletClient(config, {
   authGate: makeCallbackAuthGate({
@@ -325,7 +325,7 @@ createWalletClient(config, {
 
 Browser passkeys:
 ```typescript
-import { makeWebAuthnAuthGate } from "@wallet/core"
+import { makeWebAuthnAuthGate } from "cow-wallet"
 
 createWalletClient(config, {
   authGate: makeWebAuthnAuthGate({
@@ -340,7 +340,7 @@ createWalletClient(config, {
 Default: in-memory (clears on refresh). Override:
 
 ```typescript
-import { makeSecureStorageAdapter } from "@wallet/core"
+import { makeSecureStorageAdapter } from "cow-wallet"
 
 createWalletClient(config, {
   storage: makeSecureStorageAdapter({
@@ -354,13 +354,13 @@ createWalletClient(config, {
 
 String-backed variant (auto base64):
 ```typescript
-import { makeStringSecureStorageAdapter } from "@wallet/core"
+import { makeStringSecureStorageAdapter } from "cow-wallet"
 ```
 
 ### Backup Providers
 
 ```typescript
-import { iCloudBackupAdapter, googleDriveBackupAdapter } from "@wallet/core"
+import { iCloudBackupAdapter, googleDriveBackupAdapter } from "cow-wallet"
 
 createWalletClient(config, {
   backup: iCloudBackupAdapter({
@@ -373,12 +373,12 @@ createWalletClient(config, {
 
 ## Writing Tests
 
-Use `@wallet/core/test` for the pre-wired test harness:
+Use `cow-wallet/test` for the pre-wired test harness:
 
 ```typescript
-import { makeTestHarness } from "@wallet/core/test"
+import { makeTestHarness } from "cow-wallet/test"
 import { Effect } from "effect"
-import { KeyringService, TransferService } from "@wallet/core"
+import { KeyringService, TransferService } from "cow-wallet"
 
 const { layer, seed } = makeTestHarness()
 
@@ -398,7 +398,7 @@ await Effect.runPromise(Effect.provide(program, layer))
 For promise-based tests, use `createWalletClient` with mock adapters:
 
 ```typescript
-import { createWalletClient, makeMockFetchAdapter, makeChainAdapterRegistryLayer, makeMockChainAdapter } from "@wallet/core"
+import { createWalletClient, makeMockFetchAdapter, makeChainAdapterRegistryLayer, makeMockChainAdapter } from "cow-wallet"
 
 const adapters = new Map()
 for (const chain of config.chains) {
@@ -476,5 +476,5 @@ import {
   USDC_ASSETS,                    // { aptos: { chain, type, symbol, decimals, address }, solana: ..., "evm:1": ... }
   DEFAULT_CCTP_POLL_INTERVAL_MS,  // 2000
   DEFAULT_CCTP_TIMEOUT_MS,        // 1800000 (30 min)
-} from "@wallet/core"
+} from "cow-wallet"
 ```

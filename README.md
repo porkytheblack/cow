@@ -5,13 +5,13 @@ A multichain wallet library built on Effect TS. Supports **Aptos**, **Solana**, 
 Two entry points: a **promise-based client** for app developers and an **Effect TS layer** for advanced composition.
 
 ```
-pnpm add @wallet/core
+pnpm add cow-wallet
 ```
 
 ## Quick Start
 
 ```typescript
-import { createWalletClient } from "@wallet/core/client"
+import { createWalletClient } from "cow-wallet/client"
 
 // Minimal — only chains required. CCTP, auth, keyring get sensible defaults.
 const wallet = createWalletClient({
@@ -164,7 +164,7 @@ The default auth gate auto-approves everything (for development). Wire a real on
 
 **Browser (WebAuthn passkeys):**
 ```typescript
-import { createWalletClient, makeWebAuthnAuthGate } from "@wallet/core"
+import { createWalletClient, makeWebAuthnAuthGate } from "cow-wallet"
 
 const wallet = createWalletClient(config, {
   authGate: makeWebAuthnAuthGate({
@@ -177,7 +177,7 @@ const wallet = createWalletClient(config, {
 
 **React Native / custom UI:**
 ```typescript
-import { createWalletClient, makeCallbackAuthGate } from "@wallet/core"
+import { createWalletClient, makeCallbackAuthGate } from "cow-wallet"
 
 const wallet = createWalletClient(config, {
   authGate: makeCallbackAuthGate({
@@ -200,7 +200,7 @@ const wallet = createWalletClient(config, {
 Default is in-memory (lost on refresh). For production:
 
 ```typescript
-import { createWalletClient, makeSecureStorageAdapter } from "@wallet/core"
+import { createWalletClient, makeSecureStorageAdapter } from "cow-wallet"
 
 const wallet = createWalletClient(config, {
   storage: makeSecureStorageAdapter({
@@ -214,13 +214,13 @@ const wallet = createWalletClient(config, {
 
 Or use the string-backed variant that handles base64 automatically:
 ```typescript
-import { makeStringSecureStorageAdapter } from "@wallet/core"
+import { makeStringSecureStorageAdapter } from "cow-wallet"
 ```
 
 ### Backup Providers
 
 ```typescript
-import { createWalletClient, iCloudBackupAdapter, googleDriveBackupAdapter } from "@wallet/core"
+import { createWalletClient, iCloudBackupAdapter, googleDriveBackupAdapter } from "cow-wallet"
 
 const wallet = createWalletClient(config, {
   backup: iCloudBackupAdapter({
@@ -237,7 +237,7 @@ For power users who want full composition, streaming, custom retry policies, or 
 
 ```typescript
 import { Effect } from "effect"
-import { createWallet, KeyringService, TransferService, BalanceService } from "@wallet/core"
+import { createWallet, KeyringService, TransferService, BalanceService } from "cow-wallet"
 
 const layer = createWallet(config)
 
@@ -267,7 +267,7 @@ await Effect.runPromise(Effect.provide(program, layer))
 All adapters are swappable via Effect's Layer system:
 
 ```typescript
-import { createWallet, makeMockFetchAdapter, InMemoryStorageAdapter, TestAuthGate } from "@wallet/core"
+import { createWallet, makeMockFetchAdapter, InMemoryStorageAdapter, TestAuthGate } from "cow-wallet"
 
 const testLayer = createWallet(testConfig, {
   fetch: makeMockFetchAdapter({ handlers: [...], fallbackTo404: true }),
@@ -276,10 +276,10 @@ const testLayer = createWallet(testConfig, {
 })
 ```
 
-The test helpers at `@wallet/core/test` provide `makeTestHarness()` which pre-wires mock adapters and lets you seed balances:
+The test helpers at `cow-wallet/test` provide `makeTestHarness()` which pre-wires mock adapters and lets you seed balances:
 
 ```typescript
-import { makeTestHarness } from "@wallet/core/test"
+import { makeTestHarness } from "cow-wallet/test"
 
 const { layer, seed } = makeTestHarness()
 seed(address, usdcAsset, 100_000_000n)
@@ -329,7 +329,7 @@ Requires a caller-constructed `Aptos` client instance. Use `makeAptosAwareRegist
 
 ```typescript
 import { Aptos, AptosConfig, Network } from "@aptos-labs/ts-sdk"
-import { createWalletClient, makeAptosAwareRegistryLive } from "@wallet/core"
+import { createWalletClient, makeAptosAwareRegistryLive } from "cow-wallet"
 
 const aptosClient = new Aptos(new AptosConfig({ network: Network.MAINNET }))
 const wallet = createWalletClient(config, {
@@ -365,7 +365,7 @@ import {
   DEFAULT_DERIVATION_PATHS,  // BIP-44 paths per chain
   CCTP_DOMAINS,              // Circle domain IDs per chain
   USDC_ASSETS,               // Well-known USDC asset descriptors
-} from "@wallet/core"
+} from "cow-wallet"
 ```
 
 ## License

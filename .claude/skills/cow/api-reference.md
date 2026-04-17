@@ -1,6 +1,6 @@
 # COW API Reference
 
-Complete type signatures for `@wallet/core`.
+Complete type signatures for `cow-wallet`.
 
 ## Factory functions
 

@@ -8,7 +8,7 @@ allowed-tools: Read Grep Bash(pnpm *) Bash(node *)
 
 # COW (COol Wallet) — Coding Skill
 
-COW is the multichain wallet library at `packages/wallet-core`. It supports **Aptos**, **Solana**, and **EVM** chains with **CCTP V2** cross-chain USDC transfers.
+COW is the multichain wallet library published as `cow-wallet` on npm (source at `packages/wallet-core`). It supports **Aptos**, **Solana**, and **EVM** chains with **CCTP V1/V2** cross-chain USDC transfers.
 
 ## Installed version
 
@@ -21,7 +21,7 @@ cat packages/wallet-core/package.json | grep '"version"' 2>/dev/null || echo "un
 ### Promise API (default for app code)
 
 ```typescript
-import { createWalletClient } from "@wallet/core/client"
+import { createWalletClient } from "cow-wallet/client"
 
 const wallet = createWalletClient(config)
 const { mnemonic, keys } = await wallet.generate()
@@ -30,7 +30,7 @@ const { mnemonic, keys } = await wallet.generate()
 ### Effect API (only for test harnesses / custom Layer composition)
 
 ```typescript
-import { createWallet, KeyringService } from "@wallet/core"
+import { createWallet, KeyringService } from "cow-wallet"
 import { Effect } from "effect"
 
 const layer = createWallet(config)
@@ -222,7 +222,7 @@ Pass as second arg to `createWalletClient(config, overrides)`:
 ### Auth (default auto-approves — MUST override for prod)
 
 ```typescript
-import { makeCallbackAuthGate } from "@wallet/core"
+import { makeCallbackAuthGate } from "cow-wallet"
 
 createWalletClient(config, {
   authGate: makeCallbackAuthGate({
@@ -240,7 +240,7 @@ Browser passkeys: `makeWebAuthnAuthGate({ rpId, credentialIds })`
 ### Storage (default in-memory — MUST override for prod)
 
 ```typescript
-import { makeSecureStorageAdapter } from "@wallet/core"
+import { makeSecureStorageAdapter } from "cow-wallet"
 
 createWalletClient(config, {
   storage: makeSecureStorageAdapter({
@@ -255,7 +255,7 @@ createWalletClient(config, {
 ### Backup
 
 ```typescript
-import { iCloudBackupAdapter, googleDriveBackupAdapter } from "@wallet/core"
+import { iCloudBackupAdapter, googleDriveBackupAdapter } from "cow-wallet"
 
 createWalletClient(config, {
   backup: iCloudBackupAdapter({ saveFile, loadFile, checkStatus }),
@@ -288,7 +288,7 @@ import {
   USDC_ASSETS,                    // Well-known USDC descriptors
   DEFAULT_CCTP_POLL_INTERVAL_MS,  // 2000
   DEFAULT_CCTP_TIMEOUT_MS,        // 1800000
-} from "@wallet/core"
+} from "cow-wallet"
 ```
 
 ## Full API reference
