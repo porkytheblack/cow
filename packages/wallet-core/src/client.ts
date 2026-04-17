@@ -5,7 +5,9 @@ import type { ChainId } from "./model/chain.js"
 import type { DerivedKey, Mnemonic } from "./model/keyring.js"
 import type { SignedTx, TxReceipt, UnsignedTx } from "./model/transaction.js"
 import type { TransferIntent, TransferPlan } from "./model/transfer.js"
-import type { WalletConfig } from "./config/index.js"
+import type { WalletConfig, WalletConfigInput } from "./config/index.js"
+import { resolveConfig } from "./config/index.js"
+import { USDC_ASSETS } from "./config/defaults.js"
 import { createWallet, type WalletAdapterOverrides, type WalletLayer } from "./create-wallet.js"
 import { KeyringService } from "./services/keyring.js"
 import { SignerService } from "./services/signer.js"
@@ -104,6 +106,35 @@ export interface WalletClient {
 
   // --- Escape hatch ---------------------------------------------------
 
+  // --- Utilities -------------------------------------------------------
+
+  /**
+   * Look up a well-known asset by symbol and chain from the built-in
+   * defaults (USDC on major chains). Returns undefined if not found.
+   */
+  asset(symbol: string, chain: ChainId): AssetId | undefined
+
+  /**
+   * Parse a human-readable amount into the smallest-unit bigint.
+   * `parseUnits("10.5", 6)` -> `10_500_000n`
+   */
+  parseUnits(amount: string, decimals: number): bigint
+
+  /**
+   * Format a smallest-unit bigint into a human-readable string.
+   * `formatUnits(10_500_000n, 6)` -> `"10.5"`
+   */
+  formatUnits(amount: bigint, decimals: number): string
+
+  /**
+   * Tear down the managed runtime, releasing any resources held by
+   * the Layer (storage refs, adapter state). Call this in tests or
+   * when the wallet instance is no longer needed.
+   */
+  dispose(): Promise<void>
+
+  // --- Escape hatch ---------------------------------------------------
+
   /**
    * The underlying Effect Layer for callers who want to compose
    * services directly, override adapters, or run effects in a
@@ -113,26 +144,41 @@ export interface WalletClient {
 }
 
 /**
- * Build a promise-based `WalletClient` from a `WalletConfig` (and
- * optional adapter overrides). This is the main entry point for
- * consumers who don't use Effect TS.
+ * Build a promise-based `WalletClient`. Accepts either a full
+ * `WalletConfig` or a minimal `WalletConfigInput` (only `chains` is
+ * required — `cctp`, `auth`, `keyring` get sensible defaults).
  *
- * Internally it calls `createWallet(config, overrides)` to produce a
- * fully-wired `Layer`, then creates a `ManagedRuntime` that keeps
- * Layer state (storage Refs, adapter instances) alive across method
- * calls. Every public method just runs `Effect.runPromise` on that
- * shared runtime.
+ * ```ts
+ * // Minimal — just chains:
+ * const wallet = createWalletClient({
+ *   chains: [{ chainId: "evm:1", kind: "evm", name: "Ethereum", rpcUrl: "...", nativeAsset: { ... } }],
+ * })
+ *
+ * // Full control:
+ * const wallet = createWalletClient(fullConfig, { storage: mySecureStore, authGate: myAuthGate })
+ * ```
  */
 export const createWalletClient = (
-  config: WalletConfig,
+  configInput: WalletConfig | WalletConfigInput,
   overrides?: WalletAdapterOverrides,
 ): WalletClient => {
-  const walletLayer = createWallet(config, overrides)
+  const config = resolveConfig(configInput as WalletConfigInput)
 
-  // ManagedRuntime builds the layer once and caches it — Refs inside
-  // InMemoryStorageAdapter (and any other stateful layers) persist
-  // across calls. Without this, each runPromise would get a fresh
-  // layer build and lose stored keys/balances/state.
+  // Warn on dangerous defaults that should never ship to production.
+  if (!overrides?.storage) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[cow] No storage adapter provided — using in-memory storage. Keys will be lost on page refresh. Pass a storage override for production.",
+    )
+  }
+  if (!overrides?.authGate) {
+    // eslint-disable-next-line no-console
+    console.warn(
+      "[cow] No auth gate provided — using auto-approve (TestAuthGate). Every transaction will be signed without user confirmation. Pass an authGate override for production.",
+    )
+  }
+
+  const walletLayer = createWallet(config, overrides)
   const runtime = ManagedRuntime.make(walletLayer)
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -286,5 +332,31 @@ export const createWalletClient = (
           return yield* auth.deriveEncryptionKey()
         }),
       ),
+
+    // --- Utilities -------------------------------------------------------
+
+    asset: (symbol, chain) => {
+      if (symbol.toUpperCase() === "USDC") {
+        return (USDC_ASSETS as Partial<Record<string, AssetId>>)[
+          chain as string
+        ]
+      }
+      return undefined
+    },
+
+    parseUnits: (amount, decimals) => {
+      const [whole = "0", frac = ""] = amount.split(".")
+      const padded = frac.padEnd(decimals, "0").slice(0, decimals)
+      return BigInt(whole) * 10n ** BigInt(decimals) + BigInt(padded)
+    },
+
+    formatUnits: (amount, decimals) => {
+      const s = amount.toString().padStart(decimals + 1, "0")
+      const whole = s.slice(0, s.length - decimals)
+      const frac = s.slice(s.length - decimals).replace(/0+$/, "")
+      return frac ? `${whole}.${frac}` : whole
+    },
+
+    dispose: () => runtime.dispose(),
   }
 }

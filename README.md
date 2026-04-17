@@ -13,30 +13,12 @@ pnpm add @wallet/core
 ```typescript
 import { createWalletClient } from "@wallet/core/client"
 
+// Minimal — only chains required. CCTP, auth, keyring get sensible defaults.
 const wallet = createWalletClient({
   chains: [
-    { chainId: "evm:1", kind: "evm", name: "Ethereum", rpcUrl: "https://eth.llamarpc.com", cctpDomain: 0, nativeAsset: { chain: "evm:1", type: "native", symbol: "ETH", decimals: 18 } },
-    { chainId: "evm:8453", kind: "evm", name: "Base", rpcUrl: "https://mainnet.base.org", cctpDomain: 6, nativeAsset: { chain: "evm:8453", type: "native", symbol: "ETH", decimals: 18 } },
-    { chainId: "solana", kind: "solana", name: "Solana", rpcUrl: "https://api.mainnet-beta.solana.com", cctpDomain: 5, nativeAsset: { chain: "solana", type: "native", symbol: "SOL", decimals: 9 } },
+    { chainId: "evm:1", kind: "evm", name: "Ethereum", rpcUrl: "https://eth.llamarpc.com", nativeAsset: { chain: "evm:1", type: "native", symbol: "ETH", decimals: 18 } },
+    { chainId: "evm:8453", kind: "evm", name: "Base", rpcUrl: "https://mainnet.base.org", nativeAsset: { chain: "evm:8453", type: "native", symbol: "ETH", decimals: 18 } },
   ],
-  cctp: {
-    attestationApiUrl: "https://iris-api.circle.com/v2",
-    contractAddresses: {
-      "evm:1": { tokenMessenger: "0xbd3fa...", messageTransmitter: "0xc309...", usdcToken: "0xa0b8..." },
-      "evm:8453": { tokenMessenger: "0x1682...", messageTransmitter: "0xaD09...", usdcToken: "0x833...", },
-    },
-    attestationPollIntervalMs: 2000,
-    attestationTimeoutMs: 1800000,
-  },
-  auth: { elevatedThreshold: 100_000_000n, sessionTtlMs: 300_000, pinMinLength: 4 },
-  keyring: {
-    mnemonicStrength: 128,
-    derivationPaths: {
-      "evm:1": "m/44'/60'/0'/0/0",
-      "evm:8453": "m/44'/60'/0'/0/0",
-      solana: "m/44'/501'/0'/0'",
-    },
-  },
 })
 
 // Generate a wallet
@@ -106,6 +88,19 @@ You can dry-run without executing:
 ```typescript
 const plan = await wallet.planTransfer(intent)
 console.log(plan.isCrossChain, plan.steps.map(s => s.type))
+```
+
+### Amount Helpers
+
+```typescript
+// Parse "10.5 USDC" into smallest units
+const amount = wallet.parseUnits("10.5", 6)  // 10_500_000n
+
+// Format back
+wallet.formatUnits(10_500_000n, 6)           // "10.5"
+
+// Look up a well-known asset
+const usdc = wallet.asset("USDC", "evm:1")   // AssetId for USDC on Ethereum
 ```
 
 ### Balances
@@ -302,6 +297,21 @@ seed(address, usdcAsset, 100_000_000n)
 | Avalanche | `evm` | secp256k1 (EIP-1559) | Yes | Production |
 | Solana | `solana` | ed25519 | Scaffolded | RPC + signing ready |
 | Aptos | `aptos` | ed25519 | Scaffolded | Requires SDK client |
+
+### CCTP V1 vs V2
+
+Aptos and Solana use CCTP V1 (`depositForBurn` with 4 params). EVM chains use V2 (7 params with `destinationCaller`, `maxFee`, `minFinalityThreshold`). The library handles this automatically based on the `version` field in your CCTP contract config:
+
+```typescript
+cctp: {
+  contractAddresses: {
+    "evm:1": { tokenMessenger: "0x...", messageTransmitter: "0x...", usdcToken: "0x...", version: "v2" },
+    aptos:   { tokenMessenger: "0x...", messageTransmitter: "0x...", usdcToken: "0x...", version: "v1" },
+  },
+}
+```
+
+When omitted, version defaults based on the `CCTP_VERSIONS` constant (V2 for EVM, V1 for Aptos/Solana). The attestation API and `receiveMessage` are version-agnostic — only the burn encoding differs.
 
 ### EVM Chains
 

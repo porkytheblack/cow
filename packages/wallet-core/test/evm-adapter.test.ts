@@ -201,6 +201,31 @@ describe("EvmChainAdapter", () => {
     expect(signed.hash.length).toBe(66)
   })
 
+  it("encodes a CCTP V1 depositForBurn payload (4 params, no fee/finality)", () => {
+    const tx = buildEvmCctpBurnTx(
+      evmChain,
+      {
+        tokenMessenger: "0x1234567890123456789012345678901234567890",
+        messageTransmitter: "0x0987654321098765432109876543210987654321",
+        usdcToken: USDC.address as `0x${string}`,
+        version: "v1",
+      },
+      {
+        from: "0x1111111111111111111111111111111111111111",
+        recipient: "0x2222222222222222222222222222222222222222",
+        amount: 10_000_000n,
+        destinationDomain: 9,
+      },
+    )
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const payload = tx.payload as any
+    expect(payload.kind).toBe("cctp-burn")
+    // V1: depositForBurn(uint256,uint32,bytes32,address)
+    // 4-byte selector + 4 * 32-byte params = 136 hex chars = 2 + 8 + 4*64
+    expect(payload.data.length).toBe(2 + 8 + 4 * 64)
+    expect(tx.metadata.intent).toContain("V1")
+  })
+
   it("encodes a CCTP V2 depositForBurn payload", () => {
     const tx = buildEvmCctpBurnTx(
       evmChain,

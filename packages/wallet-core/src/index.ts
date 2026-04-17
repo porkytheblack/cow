@@ -7,14 +7,18 @@ export * from "./model/index.js"
 export {
   WalletConfigService,
   makeWalletConfigLayer,
+  resolveConfig,
   type WalletConfig,
+  type WalletConfigInput,
   type CctpConfig,
+  type CctpContractAddresses,
   type AuthConfig,
   type KeyringConfig,
 } from "./config/index.js"
 export {
   DEFAULT_DERIVATION_PATHS,
   CCTP_DOMAINS,
+  CCTP_VERSIONS,
   USDC_ASSETS,
   DEFAULT_CCTP_POLL_INTERVAL_MS,
   DEFAULT_CCTP_TIMEOUT_MS,

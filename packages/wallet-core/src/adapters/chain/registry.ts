@@ -54,6 +54,7 @@ export const ChainAdapterRegistryLive = Layer.effect(
                     tokenMessenger: cctp.tokenMessenger as `0x${string}`,
                     messageTransmitter: cctp.messageTransmitter as `0x${string}`,
                     usdcToken: cctp.usdcToken as `0x${string}`,
+                    version: cctp.version,
                   }
                 : undefined,
             }),

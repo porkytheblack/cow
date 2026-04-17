@@ -95,18 +95,27 @@ const ERC20_BALANCE_OF_ABI = [
 ] as const
 
 /**
- * CCTP V2 TokenMessenger.depositForBurn selector. The architecture
- * references CCTP V2 so we use its signature.
- *
- *   depositForBurn(
- *     uint256 amount,
- *     uint32 destinationDomain,
- *     bytes32 mintRecipient,
- *     address burnToken,
- *     bytes32 destinationCaller,
- *     uint256 maxFee,
- *     uint32 minFinalityThreshold
- *   )
+ * CCTP V1 TokenMessenger.depositForBurn (4 params — used by chains
+ * that haven't upgraded to V2 yet, e.g. Aptos).
+ */
+const CCTP_V1_DEPOSIT_FOR_BURN_ABI = [
+  {
+    type: "function",
+    name: "depositForBurn",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "amount", type: "uint256" },
+      { name: "destinationDomain", type: "uint32" },
+      { name: "mintRecipient", type: "bytes32" },
+      { name: "burnToken", type: "address" },
+    ],
+    outputs: [{ type: "uint64" }],
+  },
+] as const
+
+/**
+ * CCTP V2 TokenMessenger.depositForBurn (7 params — adds
+ * destinationCaller, maxFee, minFinalityThreshold).
  */
 const CCTP_V2_DEPOSIT_FOR_BURN_ABI = [
   {
@@ -176,6 +185,7 @@ export interface EvmAdapterOptions {
     readonly tokenMessenger: Address
     readonly messageTransmitter: Address
     readonly usdcToken: Address
+    readonly version?: "v1" | "v2"
   }
 }
 
@@ -700,9 +710,10 @@ export const makeEvmChainAdapter = (
 }
 
 /**
- * Build a CCTP V2 depositForBurn transaction on an EVM chain.
- * Exported for CctpService so it can wire the burn step without
- * reaching into adapter internals.
+ * Build a CCTP depositForBurn transaction on an EVM chain.
+ * Supports both V1 (4 params) and V2 (7 params). V2 is the
+ * default; pass `version: "v1"` for chains still on V1 (e.g.
+ * when burning to Aptos).
  */
 export const buildEvmCctpBurnTx = (
   chainConfig: ChainConfig,
@@ -710,6 +721,7 @@ export const buildEvmCctpBurnTx = (
     readonly tokenMessenger: Address
     readonly messageTransmitter: Address
     readonly usdcToken: Address
+    readonly version?: "v1" | "v2"
   },
   params: {
     readonly from: string
@@ -718,19 +730,31 @@ export const buildEvmCctpBurnTx = (
     readonly destinationDomain: number
   },
 ): UnsignedTx => {
-  const data = encodeFunctionData({
-    abi: CCTP_V2_DEPOSIT_FOR_BURN_ABI,
-    functionName: "depositForBurn",
-    args: [
-      params.amount,
-      params.destinationDomain,
-      asBytes32(params.recipient),
-      cctpContracts.usdcToken,
-      emptyBytes32, // destinationCaller = allow any
-      params.amount / 1000n, // maxFee = 0.1%
-      1000, // minFinalityThreshold — soft finality
-    ],
-  })
+  const isV1 = cctpContracts.version === "v1"
+  const data = isV1
+    ? encodeFunctionData({
+        abi: CCTP_V1_DEPOSIT_FOR_BURN_ABI,
+        functionName: "depositForBurn",
+        args: [
+          params.amount,
+          params.destinationDomain,
+          asBytes32(params.recipient),
+          cctpContracts.usdcToken,
+        ],
+      })
+    : encodeFunctionData({
+        abi: CCTP_V2_DEPOSIT_FOR_BURN_ABI,
+        functionName: "depositForBurn",
+        args: [
+          params.amount,
+          params.destinationDomain,
+          asBytes32(params.recipient),
+          cctpContracts.usdcToken,
+          emptyBytes32,
+          params.amount / 1000n,
+          1000,
+        ],
+      })
   const payload: EvmCallPayload = {
     kind: "cctp-burn",
     to: cctpContracts.tokenMessenger,
@@ -743,7 +767,7 @@ export const buildEvmCctpBurnTx = (
     payload,
     estimatedFee: 200_000n * 20_000_000_000n,
     metadata: {
-      intent: `CCTP burn ${params.amount} USDC`,
+      intent: `CCTP ${isV1 ? "V1" : "V2"} burn ${params.amount} USDC`,
       createdAt: Date.now(),
     },
   }
