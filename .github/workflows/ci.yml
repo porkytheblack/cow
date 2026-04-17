@@ -24,6 +24,29 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm typecheck
 
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - name: Verify dist entry points exist
+        run: |
+          test -f packages/wallet-core/dist/index.js
+          test -f packages/wallet-core/dist/index.d.ts
+          test -f packages/wallet-core/dist/client.js
+          test -f packages/wallet-core/dist/client.d.ts
+          test -f packages/wallet-core/dist/config.js
+          test -f packages/wallet-core/dist/config.d.ts
+          test -f packages/wallet-core/dist/test.js
+          test -f packages/wallet-core/dist/test.d.ts
+
   test:
     name: Test (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
