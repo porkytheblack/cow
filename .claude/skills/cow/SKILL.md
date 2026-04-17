@@ -1,7 +1,7 @@
 ---
 name: cow
-description: "Write correct code against the COW (COol Wallet) multichain wallet library. Use when building wallet features: key generation, balance queries, transfers (same-chain and cross-chain CCTP), backup/restore, auth gates, or adapter wiring. Covers both the promise API (createWalletClient) and the Effect TS API (createWallet)."
-when_to_use: "wallet integration, key generation, mnemonic import, private key import, balance check, portfolio query, same-chain transfer, cross-chain USDC transfer, CCTP, backup, restore, auth gate, secure storage, signing, broadcasting, multi-account"
+description: "Write correct code against the COW (COol Wallet) multichain wallet library. Use when building wallet features: key generation, balance queries, transfers (same-chain and cross-chain CCTP), arbitrary contract calls (sendCall / buildCall / simulateCall), backup/restore, auth gates, or adapter wiring. Covers both the promise API (createWalletClient) and the Effect TS API (createWallet)."
+when_to_use: "wallet integration, key generation, mnemonic import, private key import, balance check, portfolio query, same-chain transfer, cross-chain USDC transfer, CCTP, arbitrary contract call, entry function, program invocation, sendCall, buildCall, simulateCall, backup, restore, auth gate, secure storage, signing, broadcasting, multi-account"
 argument-hint: "[feature or question]"
 allowed-tools: Read Grep Bash(pnpm *) Bash(node *)
 ---
@@ -101,6 +101,11 @@ wallet.planTransfer(intent)                           // -> TransferPlan (dry-ru
 wallet.sign(unsignedTx)                               // -> SignedTx
 wallet.broadcast(signedTx)                            // -> TxReceipt
 
+// Arbitrary contract / program / entry-function calls
+wallet.buildCall(req)                                  // -> UnsignedTx (no sign)
+wallet.sendCall(req)                                   // -> TxReceipt (build + sign + broadcast)
+wallet.simulateCall(req)                               // -> CallSimulation (dry-run)
+
 // CCTP resume (after app restart mid-transfer)
 wallet.listPendingTransfers()                          // -> PendingCctpTransfer[]
 wallet.resumeTransfer(id)                              // -> ResumeResult (reads recipient/destChain from record)
@@ -190,6 +195,103 @@ await wallet.transfer({
   amount: 50_000_000n,
 })
 // burn -> poll attestation -> mint, all automatic
+```
+
+### Arbitrary contract / program / entry-function calls
+
+Use `sendCall` / `buildCall` / `simulateCall` for anything beyond native / USDC transfers. They reuse the same key-isolated signing, auth gate, session, elevated-fee, and broadcast pipeline — so every guarantee from `transfer()` applies.
+
+`CallRequest` is a discriminated union — one variant per chain kind:
+
+```typescript
+type CallRequest = EvmCallRequest | SolanaCallRequest | AptosCallRequest
+```
+
+#### EVM — contract interaction
+
+```typescript
+import { encodeFunctionData } from "viem"
+
+const data = encodeFunctionData({
+  abi: [{ type: "function", name: "approve", stateMutability: "nonpayable",
+          inputs: [{ name: "s", type: "address" }, { name: "a", type: "uint256" }],
+          outputs: [{ type: "bool" }] }] as const,
+  functionName: "approve",
+  args: ["0xRouter...", 10_000_000n],
+})
+
+const receipt = await wallet.sendCall({
+  kind: "evm",
+  chain: "evm:1",
+  from: evmKey.address,
+  to: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // USDC
+  data,
+  value: 0n,                // optional, default 0n
+  label: "Approve USDC",    // shown in auth prompt + stored as metadata.intent
+  // optional overrides — any omitted field is estimated via RPC:
+  // gas, maxFeePerGas, maxPriorityFeePerGas, gasPrice, nonce
+})
+```
+
+#### Solana — arbitrary program invocation
+
+```typescript
+const receipt = await wallet.sendCall({
+  kind: "solana",
+  chain: "solana",
+  from: solKey.address,
+  instructions: [
+    {
+      programId: "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",
+      keys: [{ pubkey: solKey.address, isSigner: true, isWritable: false }],
+      data: new TextEncoder().encode("hello"),
+    },
+  ],
+  label: "Post memo",
+})
+```
+
+You can attach multiple instructions in one tx. Keys use base58 pubkeys; data is raw program-specific bytes.
+
+#### Aptos — entry function
+
+```typescript
+const receipt = await wallet.sendCall({
+  kind: "aptos",
+  chain: "aptos",
+  from: aptosKey.address,
+  function: "0x1::coin::transfer",
+  typeArguments: ["0x1::aptos_coin::AptosCoin"],
+  functionArguments: [recipient, "1000"],
+  label: "Custom APT transfer",
+})
+```
+
+#### Build without signing
+
+```typescript
+const tx = await wallet.buildCall(req)   // UnsignedTx — inspect fee, metadata
+const signed = await wallet.sign(tx)     // goes through auth gate + keyring
+const receipt = await wallet.broadcast(signed)
+```
+
+#### Simulate (dry-run, no signing)
+
+```typescript
+const sim = await wallet.simulateCall(req)
+// EVM:    { success, returnData?, revertReason?, raw? }   // via eth_call
+// Solana: { success, gasUsed?, logs?, revertReason?, raw? } // via simulateTransaction
+// Aptos:  { success, gasUsed?, revertReason?, raw? }     // via simulate.simple
+if (!sim.success) throw new Error(sim.revertReason)
+```
+
+#### Sessions apply identically
+
+```typescript
+await wallet.approveSession("Interact with Uniswap")
+await wallet.sendCall({ kind: "evm", chain: "evm:1", from, to: router, data: swap1 })
+await wallet.sendCall({ kind: "evm", chain: "evm:1", from, to: router, data: swap2 })
+await wallet.endSession()
 ```
 
 ### Auth session for multi-tx flow

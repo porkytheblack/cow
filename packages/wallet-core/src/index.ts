@@ -96,6 +96,7 @@ export {
   type TransferResult,
   type CompletedStep,
 } from "./services/transfer.js"
+export { CallService, CallServiceLive } from "./services/call.js"
 
 // Factory
 export { createWallet, type WalletAdapterOverrides, type WalletLayer } from "./create-wallet.js"

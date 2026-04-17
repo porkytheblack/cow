@@ -1,6 +1,7 @@
 import { Context, Effect } from "effect"
 import type { AssetId } from "../../model/asset.js"
 import type { TokenBalance } from "../../model/balance.js"
+import type { CallRequest, CallSimulation } from "../../model/call.js"
 import type { BurnMessage } from "../../model/cctp.js"
 import type { ChainId } from "../../model/chain.js"
 import type { SignedTx, TxReceipt, UnsignedTx } from "../../model/transaction.js"
@@ -103,6 +104,28 @@ export interface ChainAdapter {
     tx: UnsignedTx,
     privateKey: Uint8Array,
   ) => Effect.Effect<SignedTx>
+
+  /**
+   * Build an `UnsignedTx` for an arbitrary contract call / entry-function
+   * invocation. The adapter validates that `req.kind` matches its chain
+   * kind and fails with `UnsupportedChainError` otherwise. Used by
+   * `CallService.build`.
+   */
+  readonly buildCallTx: (
+    req: CallRequest,
+  ) => Effect.Effect<UnsignedTx, FeeEstimationError | UnsupportedChainError>
+
+  /**
+   * Dry-run the call without signing. Returns return-data / gasUsed on
+   * success and `revertReason` / `logs` on failure. Adapters map the
+   * chain-native simulate response into `CallSimulation`.
+   */
+  readonly simulateCall: (
+    req: CallRequest,
+  ) => Effect.Effect<
+    CallSimulation,
+    FeeEstimationError | UnsupportedChainError
+  >
 
   /**
    * Build a CCTP burn (`depositForBurn`) tx for this chain. Adapters

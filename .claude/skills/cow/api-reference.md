@@ -184,6 +184,61 @@ interface TxMetadata {
   readonly transferId?: string
 }
 
+// Arbitrary contract / program / entry-function calls — one variant
+// per chain kind. Used by wallet.buildCall / sendCall / simulateCall.
+type CallRequest = EvmCallRequest | SolanaCallRequest | AptosCallRequest
+
+interface EvmCallRequest {
+  readonly kind: "evm"
+  readonly chain: ChainId                    // must start with "evm:"
+  readonly from: string
+  readonly to: string
+  readonly data?: `0x${string}`              // default "0x"
+  readonly value?: bigint                    // default 0n
+  readonly gas?: bigint                      // RPC-estimated if omitted
+  readonly maxFeePerGas?: bigint
+  readonly maxPriorityFeePerGas?: bigint
+  readonly gasPrice?: bigint                 // legacy fallback
+  readonly nonce?: number
+  readonly label?: string                    // auth-prompt reason + metadata.intent
+}
+
+interface SolanaInstructionInput {
+  readonly programId: string                 // base58
+  readonly keys: readonly {
+    readonly pubkey: string                  // base58
+    readonly isSigner: boolean
+    readonly isWritable: boolean
+  }[]
+  readonly data: Uint8Array                  // program-specific bytes
+}
+interface SolanaCallRequest {
+  readonly kind: "solana"
+  readonly chain: ChainId
+  readonly from: string
+  readonly instructions: readonly SolanaInstructionInput[]
+  readonly label?: string
+}
+
+interface AptosCallRequest {
+  readonly kind: "aptos"
+  readonly chain: ChainId
+  readonly from: string
+  readonly function: `${string}::${string}::${string}`   // "0xaddr::module::fn"
+  readonly typeArguments?: readonly string[]
+  readonly functionArguments: readonly unknown[]
+  readonly label?: string
+}
+
+interface CallSimulation {
+  readonly success: boolean
+  readonly returnData?: `0x${string}` | Uint8Array
+  readonly gasUsed?: bigint
+  readonly revertReason?: string
+  readonly logs?: readonly string[]
+  readonly raw?: unknown                     // chain-native response
+}
+
 type AuthMethod = "passkey" | "pin" | "biometric"
 type AuthLevel = "standard" | "elevated"
 
@@ -411,6 +466,7 @@ BroadcastService      // tx submission
 RouterService         // intent -> plan
 CctpService           // CCTP burn/attest/mint lifecycle
 TransferService       // top-level transfer orchestrator
+CallService           // arbitrary call orchestrator (build / simulate / execute)
 WalletConfigService   // config access
 ChainAdapterRegistry  // per-chain adapter lookup
 StorageAdapter        // key/value persistence

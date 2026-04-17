@@ -3,6 +3,7 @@ import { bytesToHex } from "@noble/hashes/utils"
 import { sha256 } from "@noble/hashes/sha256"
 import type { AssetId } from "../../model/asset.js"
 import type { TokenBalance } from "../../model/balance.js"
+import type { CallRequest, CallSimulation } from "../../model/call.js"
 import type { BurnMessage } from "../../model/cctp.js"
 import type { ChainConfig } from "../../model/chain.js"
 import type { SignedTx, TxReceipt, UnsignedTx } from "../../model/transaction.js"
@@ -17,6 +18,8 @@ interface MockState {
   readonly balances: Map<string, bigint> // key: `${address}::${symbol}`
   readonly receipts: Map<string, TxReceipt>
   nonceCounter: bigint
+  /** Overrides the next simulateCall response. Consumed on use. */
+  nextSimulation?: CallSimulation
 }
 
 const balanceKey = (address: string, asset: AssetId) =>
@@ -207,6 +210,36 @@ export const makeMockChainAdapter = (config: ChainConfig): ChainAdapter => {
         }
       }),
 
+    buildCallTx: (req) =>
+      Effect.sync(() => {
+        const tx: UnsignedTx = {
+          chain: config.chainId,
+          from: req.from,
+          payload: {
+            kind: "contract-call",
+            request: req,
+          },
+          estimatedFee: 1_500n,
+          metadata: {
+            intent:
+              req.label ??
+              `Call on ${String(config.chainId)} (kind=${req.kind})`,
+            createdAt: Date.now(),
+          },
+        }
+        return tx
+      }),
+
+    simulateCall: (_req) =>
+      Effect.sync(() => {
+        if (state.nextSimulation) {
+          const sim = state.nextSimulation
+          state.nextSimulation = undefined
+          return sim
+        }
+        return { success: true } satisfies CallSimulation
+      }),
+
     buildCctpBurnTx: ({ from, destinationDomain, recipient, amount }) =>
       Effect.sync(() => {
         const tx: UnsignedTx = {
@@ -287,8 +320,18 @@ export const makeMockChainAdapter = (config: ChainConfig): ChainAdapter => {
       })),
   }
 
+  const seedSimulation = (sim: CallSimulation) => {
+    state.nextSimulation = sim
+  }
+
   // Expose seeding for tests via a hidden handle.
-  ;(adapter as unknown as { __seed: typeof seedBalance }).__seed = seedBalance
+  ;(adapter as unknown as {
+    __seed: typeof seedBalance
+    __seedSimulation: typeof seedSimulation
+  }).__seed = seedBalance
+  ;(adapter as unknown as {
+    __seedSimulation: typeof seedSimulation
+  }).__seedSimulation = seedSimulation
 
   return adapter
 }

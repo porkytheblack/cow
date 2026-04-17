@@ -12,6 +12,7 @@ import type { WalletConfig, WalletConfigInput } from "./config/index.js"
 import { AuthGateService, TestAuthGate } from "./services/auth-gate.js"
 import { BalanceService, BalanceServiceLive } from "./services/balance.js"
 import { BroadcastService, BroadcastServiceLive } from "./services/broadcast.js"
+import { CallService, CallServiceLive } from "./services/call.js"
 import { CctpService, CctpServiceLive } from "./services/cctp.js"
 import { KeyringService, KeyringServiceLive } from "./services/keyring.js"
 import { RouterService, RouterServiceLive } from "./services/router.js"
@@ -32,6 +33,7 @@ export interface WalletAdapterOverrides {
 
 export type WalletLayer = Layer.Layer<
   | TransferService
+  | CallService
   | BalanceService
   | BroadcastService
   | RouterService
@@ -94,6 +96,7 @@ export const createWallet = (
     RouterServiceLive,
     CctpServiceLive,
     TransferServiceLive,
+    CallServiceLive,
   )
 
   return Layer.mergeAll(
