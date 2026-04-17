@@ -18,6 +18,7 @@ import {
   curveFor,
   deriveAddressForChain,
   deriveKeypair,
+  derivePathForAccount,
   generateMnemonic,
   mnemonicIsValid,
   mnemonicToSeed,
@@ -44,6 +45,8 @@ interface StoredDerivedKey {
   readonly publicKeyHex: string
   readonly address: string
   readonly privateKeyHex: string
+  /** BIP-44 account index — 0 for all legacy keys and imports. */
+  readonly accountIndex: number
   /** True when the key came from `importPrivateKey`, not mnemonic derivation. */
   readonly imported?: boolean
 }
@@ -86,15 +89,40 @@ export interface KeyringServiceShape {
   readonly importPrivateKey: (
     chain: ChainId,
     privateKey: Uint8Array,
-    options?: { readonly overwrite?: boolean },
+    options?: {
+      readonly overwrite?: boolean
+      readonly accountIndex?: number
+    },
   ) => Effect.Effect<
     DerivedKey,
     KeyGenerationError | StorageError,
     StorageAdapter | WalletConfigService
   >
 
+  /**
+   * Derive a new account for `chain` from the stored mnemonic at the
+   * next unused BIP-44 account index. Fails if no mnemonic is stored
+   * (call `generate` or `importMnemonic` first).
+   */
+  readonly addAccount: (
+    chain: ChainId,
+  ) => Effect.Effect<
+    DerivedKey,
+    KeyGenerationError | KeyNotFoundError | StorageError,
+    StorageAdapter | WalletConfigService
+  >
+
+  /**
+   * Get a single derived key.
+   *
+   *   - `getKey(chain)` — returns the default (account 0) key.
+   *   - `getKey(chain, address)` — finds the key whose address matches,
+   *     across all account indices on that chain. This is the path
+   *     SignerService uses: `tx.from` tells it which account to sign with.
+   */
   readonly getKey: (
     chain: ChainId,
+    address?: string,
   ) => Effect.Effect<DerivedKey, KeyNotFoundError | StorageError, StorageAdapter>
 
   readonly listKeys: () => Effect.Effect<
@@ -109,15 +137,15 @@ export interface KeyringServiceShape {
    * transient buffer, used, and zeroed before this effect returns —
    * it is not visible to any service outside this layer.
    *
-   *   - ed25519 chains (aptos, solana): `data` is the message bytes;
-   *     the result is the 64-byte signature.
-   *   - secp256k1 chains (evm:*): `data` is the 32-byte message digest;
-   *     the result is 65 bytes = r || s || recovery.
+   * When `address` is provided the key is looked up by address (so
+   * multi-account wallets route to the right signing key based on
+   * `tx.from`). When omitted, account index 0 is used.
    */
   readonly signBytes: (
     chain: ChainId,
     data: Uint8Array,
     authProof: AuthApproval,
+    address?: string,
   ) => Effect.Effect<
     Uint8Array,
     KeyNotFoundError | AuthDeniedError | StorageError,
@@ -164,7 +192,12 @@ const toDerivedKey = (stored: StoredDerivedKey): DerivedKey => ({
   chain: stored.chain,
   publicKey: hexToBytes(stored.publicKeyHex),
   address: stored.address,
-  path: { chain: stored.chain, path: stored.path },
+  accountIndex: stored.accountIndex ?? 0,
+  path: {
+    chain: stored.chain,
+    path: stored.path,
+    accountIndex: stored.accountIndex ?? 0,
+  },
 })
 
 /**
@@ -201,6 +234,7 @@ export const KeyringServiceLive = Layer.succeed(
               publicKeyHex: bytesToHex(kp.publicKey),
               address: kp.address,
               privateKeyHex: bytesToHex(kp.privateKey),
+              accountIndex: 0,
             })
           } catch (e) {
             return yield* Effect.fail(
@@ -255,6 +289,7 @@ export const KeyringServiceLive = Layer.succeed(
               publicKeyHex: bytesToHex(kp.publicKey),
               address: kp.address,
               privateKeyHex: bytesToHex(kp.privateKey),
+              accountIndex: 0,
             })
           } catch (e) {
             return yield* Effect.fail(
@@ -308,11 +343,15 @@ export const KeyringServiceLive = Layer.succeed(
           )
         }
 
+        const acctIdx = options?.accountIndex ?? 0
         const existing = yield* loadStoredKeys(storage)
-        if (existing.some((k) => k.chain === chain) && !options?.overwrite) {
+        const collision = existing.find(
+          (k) => k.chain === chain && (k.accountIndex ?? 0) === acctIdx,
+        )
+        if (collision && !options?.overwrite) {
           return yield* Effect.fail(
             new KeyGenerationError({
-              message: `A key for ${String(chain)} already exists — pass { overwrite: true } to replace it`,
+              message: `A key for ${String(chain)} at account ${acctIdx} already exists — pass { overwrite: true } to replace it`,
             }),
           )
         }
@@ -322,26 +361,84 @@ export const KeyringServiceLive = Layer.succeed(
           publicKeyHex: bytesToHex(publicKey),
           address,
           privateKeyHex: bytesToHex(privateKey),
+          accountIndex: acctIdx,
           imported: true,
         }
-        // Keep every other chain's key untouched; replace (or append)
-        // only the entry for this chain.
         const next = existing
-          .filter((k) => k.chain !== chain)
+          .filter(
+            (k) =>
+              !(k.chain === chain && (k.accountIndex ?? 0) === acctIdx),
+          )
           .concat(stored)
         yield* saveStoredKeys(storage, next)
-        // Curve check for sanity (matches what signBytes will expect).
         curveFor(String(chain))
         return toDerivedKey(stored)
       }),
 
-    getKey: (chain) =>
+    addAccount: (chain) =>
+      Effect.gen(function* () {
+        const configService = yield* WalletConfigService
+        const storage = yield* StorageAdapter
+        const basePath = configService.config.keyring.derivationPaths[chain]
+        if (!basePath) {
+          return yield* Effect.fail(
+            new KeyGenerationError({
+              message: `No derivation path configured for chain ${String(chain)}`,
+            }),
+          )
+        }
+        const mnemonicBytes = yield* storage.load(STORAGE_KEYS.mnemonic)
+        if (!mnemonicBytes) {
+          return yield* Effect.fail(
+            new KeyNotFoundError({
+              chain: String(chain),
+              address: "mnemonic not stored — call generate() or importMnemonic() first",
+            }),
+          )
+        }
+        const phrase = textDecoder.decode(mnemonicBytes)
+        const seed = mnemonicToSeed(phrase)
+        const existing = yield* loadStoredKeys(storage)
+        const chainKeys = existing.filter((k) => k.chain === chain)
+        const nextIndex =
+          chainKeys.length === 0
+            ? 1
+            : Math.max(...chainKeys.map((k) => k.accountIndex ?? 0)) + 1
+        const path = derivePathForAccount(basePath, nextIndex)
+        try {
+          const kp = deriveKeypair(String(chain), path, seed)
+          const stored: StoredDerivedKey = {
+            chain,
+            path,
+            publicKeyHex: bytesToHex(kp.publicKey),
+            address: kp.address,
+            privateKeyHex: bytesToHex(kp.privateKey),
+            accountIndex: nextIndex,
+          }
+          yield* saveStoredKeys(storage, [...existing, stored])
+          return toDerivedKey(stored)
+        } catch (e) {
+          return yield* Effect.fail(
+            new KeyGenerationError({
+              message: `Derivation failed for ${String(chain)} at index ${nextIndex}: ${
+                (e as Error).message
+              }`,
+            }),
+          )
+        }
+      }),
+
+    getKey: (chain, address) =>
       Effect.gen(function* () {
         const storage = yield* StorageAdapter
         const keys = yield* loadStoredKeys(storage)
-        const found = keys.find((k) => k.chain === chain)
+        const found = address
+          ? keys.find((k) => k.chain === chain && k.address === address)
+          : keys.find((k) => k.chain === chain && (k.accountIndex ?? 0) === 0)
         if (!found) {
-          return yield* Effect.fail(new KeyNotFoundError({ chain: String(chain) }))
+          return yield* Effect.fail(
+            new KeyNotFoundError({ chain: String(chain), address }),
+          )
         }
         return toDerivedKey(found)
       }),
@@ -353,7 +450,7 @@ export const KeyringServiceLive = Layer.succeed(
         return keys.map(toDerivedKey)
       }),
 
-    signBytes: (chain, data, authProof) =>
+    signBytes: (chain, data, authProof, address) =>
       Effect.gen(function* () {
         if (!authProof || !authProof.method) {
           return yield* Effect.fail(
@@ -362,9 +459,15 @@ export const KeyringServiceLive = Layer.succeed(
         }
         const storage = yield* StorageAdapter
         const keys = yield* loadStoredKeys(storage)
-        const found = keys.find((k) => k.chain === chain)
+        const found = address
+          ? keys.find((k) => k.chain === chain && k.address === address)
+          : keys.find(
+              (k) => k.chain === chain && (k.accountIndex ?? 0) === 0,
+            )
         if (!found) {
-          return yield* Effect.fail(new KeyNotFoundError({ chain: String(chain) }))
+          return yield* Effect.fail(
+            new KeyNotFoundError({ chain: String(chain), address }),
+          )
         }
         // The private key is loaded into a transient local, used to
         // produce a curve-specific signature, then zeroed. Only the

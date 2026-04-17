@@ -76,9 +76,16 @@ export const SignerServiceLive = Layer.succeed(SignerService, {
       const message = yield* adapter.buildSigningMessage(tx)
 
       // 2. Ask the keyring for the public key metadata and the signature.
-      //    The private key never leaves KeyringService.
-      const derivedKey = yield* keyring.getKey(tx.chain)
-      const signature = yield* keyring.signBytes(tx.chain, message, approval)
+      //    The private key never leaves KeyringService. `tx.from` routes
+      //    to the correct account when multiple accounts exist on the
+      //    same chain.
+      const derivedKey = yield* keyring.getKey(tx.chain, tx.from)
+      const signature = yield* keyring.signBytes(
+        tx.chain,
+        message,
+        approval,
+        tx.from,
+      )
 
       // 3. Hand the signature + public key back to the adapter to assemble
       //    the broadcast-ready SignedTx.
