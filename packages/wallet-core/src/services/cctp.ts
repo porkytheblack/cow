@@ -74,11 +74,14 @@ export interface CctpServiceShape {
    * Resume a pending CCTP transfer after restart. Picks up from whichever
    * step was persisted last: awaits attestation if burn is stored, then
    * builds + signs + broadcasts the mint, and updates the persisted status.
+   *
+   * `recipient` and `destChain` are read from the stored record when
+   * omitted — they were persisted at burn time by `TransferService`.
    */
   readonly resumePending: (
     id: string,
-    recipient: string,
-    destChain: ChainId,
+    recipient?: string,
+    destChain?: ChainId,
   ) => Effect.Effect<
     ResumeResult,
     | StorageError
@@ -211,7 +214,7 @@ export const CctpServiceLive = Layer.succeed(CctpService, {
       return results
     }),
 
-  resumePending: (id, recipient, destChain) =>
+  resumePending: (id, recipientOverride, destChainOverride) =>
     Effect.gen(function* () {
       const storage = yield* StorageAdapter
       const signer = yield* SignerService
@@ -242,6 +245,18 @@ export const CctpServiceLive = Layer.succeed(CctpService, {
             operation: "read",
             key,
             cause: `failed to parse pending CCTP record: ${(e as Error).message}`,
+          }),
+        )
+      }
+
+      const recipient = recipientOverride ?? current.recipient
+      const destChain = destChainOverride ?? current.destChain
+      if (!recipient || !destChain) {
+        return yield* Effect.fail(
+          new CctpMintError({
+            destChain: destChain ?? "unknown",
+            cause:
+              "pending record has no recipient/destChain and none were supplied — cannot resume",
           }),
         )
       }
@@ -340,6 +355,9 @@ interface SerialisedPending {
   readonly createdAt: number
   readonly updatedAt: number
   readonly mintTxHash?: string
+  readonly sourceChain?: string
+  readonly destChain?: string
+  readonly recipient?: string
   readonly burn?: SerialisedBurn
   readonly attestation?: {
     readonly message: SerialisedBurn
@@ -374,6 +392,9 @@ const serialisePending = (
   createdAt: t.createdAt,
   updatedAt: t.updatedAt,
   ...(t.mintTxHash !== undefined ? { mintTxHash: t.mintTxHash } : {}),
+  ...(t.sourceChain !== undefined ? { sourceChain: t.sourceChain } : {}),
+  ...(t.destChain !== undefined ? { destChain: t.destChain } : {}),
+  ...(t.recipient !== undefined ? { recipient: t.recipient } : {}),
   ...(t.burn ? { burn: serialiseBurn(t.burn) } : {}),
   ...(t.attestation
     ? {
@@ -394,6 +415,9 @@ const deserialisePending = (
   createdAt: s.createdAt,
   updatedAt: s.updatedAt,
   ...(s.mintTxHash !== undefined ? { mintTxHash: s.mintTxHash } : {}),
+  ...(s.sourceChain !== undefined ? { sourceChain: s.sourceChain } : {}),
+  ...(s.destChain !== undefined ? { destChain: s.destChain } : {}),
+  ...(s.recipient !== undefined ? { recipient: s.recipient } : {}),
   ...(s.burn ? { burn: deserialiseBurn(s.burn) } : {}),
   ...(s.attestation
     ? {

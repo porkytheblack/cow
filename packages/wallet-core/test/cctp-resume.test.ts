@@ -112,9 +112,71 @@ describe("CctpService persistence + resume", () => {
     expect(payload.amount).toBe("5000000")
   })
 
-  // Asserts the TestHarness's CCTP_TRANSFER path by exercising
-  // USDC_APTOS.  Keeps the import list non-dead.
-  it("USDC_APTOS asset descriptor is valid", () => {
-    expect(USDC_APTOS.symbol).toBe("USDC")
+  it("PendingCctpTransfer stores sourceChain/destChain/recipient for auto-resume", async () => {
+    const { layer } = makeTestHarness()
+    const program = Effect.gen(function* () {
+      const cctp = yield* CctpService
+      const pending: PendingCctpTransfer = {
+        id: "resume-ctx",
+        planId: "plan-ctx",
+        status: "awaiting-attestation",
+        burn: {
+          sourceDomain: 9,
+          destDomain: 0,
+          nonce: 1n,
+          burnTxHash: "0xaaa",
+          messageBytes: new Uint8Array([1]),
+          messageHash: "aabbccdd",
+        },
+        sourceChain: "aptos",
+        destChain: "evm:1",
+        recipient: "0xrecipient",
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }
+      yield* cctp.savePending(pending)
+      const loaded = yield* cctp.loadPending()
+      return loaded
+    })
+    const loaded = await Effect.runPromise(Effect.provide(program, layer))
+    expect(loaded[0]!.sourceChain).toBe("aptos")
+    expect(loaded[0]!.destChain).toBe("evm:1")
+    expect(loaded[0]!.recipient).toBe("0xrecipient")
+  })
+
+  it("resumePending works without explicit recipient/destChain when stored in the record", async () => {
+    const { layer } = makeTestHarness()
+    const program = Effect.gen(function* () {
+      const keyring = yield* KeyringService
+      const cctp = yield* CctpService
+      const { keys } = yield* keyring.generate()
+      const dst = keys.find((k) => k.chain === "evm:1")!
+
+      const pending: PendingCctpTransfer = {
+        id: "auto-resume",
+        planId: "plan-auto",
+        status: "burning",
+        burn: {
+          sourceDomain: 9,
+          destDomain: 0,
+          nonce: 7n,
+          burnTxHash: "0xburn",
+          messageBytes: new Uint8Array([9, 9, 9]),
+          messageHash: "feedface",
+        },
+        destChain: "evm:1",
+        recipient: dst.address,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+      }
+      yield* cctp.savePending(pending)
+
+      // Resume without passing recipient/destChain — reads from record.
+      const result = yield* cctp.resumePending(pending.id)
+      return result
+    })
+    const result = await Effect.runPromise(Effect.provide(program, layer))
+    expect(result.transfer.status).toBe("completed")
+    expect(result.mintReceipt.status).toBe("confirmed")
   })
 })

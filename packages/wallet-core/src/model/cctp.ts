@@ -28,6 +28,12 @@ export interface PendingCctpTransfer {
   readonly burn?: BurnMessage
   readonly attestation?: Attestation
   readonly mintTxHash?: string
+  /** Source chain where the burn happened. */
+  readonly sourceChain?: string
+  /** Destination chain where the mint will happen. */
+  readonly destChain?: string
+  /** Recipient address on the destination chain. */
+  readonly recipient?: string
   readonly createdAt: number
   readonly updatedAt: number
 }
