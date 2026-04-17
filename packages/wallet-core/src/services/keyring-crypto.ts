@@ -133,7 +133,16 @@ export const deriveKeypair = (
   return { chain, path, privateKey, publicKey, address }
 }
 
-const deriveAddressForChain = (chain: string, publicKey: Uint8Array): string => {
+/**
+ * Compute the on-chain address for a given chain + public key. Exposed
+ * so `KeyringService.importPrivateKey` can validate an imported key
+ * and surface its derived address without going through a full
+ * mnemonic derivation.
+ */
+export const deriveAddressForChain = (
+  chain: string,
+  publicKey: Uint8Array,
+): string => {
   if (chain === "aptos") {
     // Aptos AuthenticationKey = sha3_256(pubkey || scheme_byte).
     // scheme_byte = 0x00 for single-signer Ed25519.

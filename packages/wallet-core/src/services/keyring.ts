@@ -15,10 +15,13 @@ import {
 import {
   aeadDecrypt,
   aeadEncrypt,
+  curveFor,
+  deriveAddressForChain,
   deriveKeypair,
   generateMnemonic,
   mnemonicIsValid,
   mnemonicToSeed,
+  publicKeyForChain,
   randomBytes,
   signMessageForChain,
 } from "./keyring-crypto.js"
@@ -41,7 +44,11 @@ interface StoredDerivedKey {
   readonly publicKeyHex: string
   readonly address: string
   readonly privateKeyHex: string
+  /** True when the key came from `importPrivateKey`, not mnemonic derivation. */
+  readonly imported?: boolean
 }
+
+const IMPORTED_PATH = "import"
 
 const STORAGE_KEYS = {
   mnemonic: "keyring:mnemonic",
@@ -59,6 +66,29 @@ export interface KeyringServiceShape {
     phrase: string,
   ) => Effect.Effect<
     readonly DerivedKey[],
+    KeyGenerationError | StorageError,
+    StorageAdapter | WalletConfigService
+  >
+
+  /**
+   * Import a single raw private key for a specific chain. The chain
+   * must be present in `WalletConfig.chains`. The stored key is
+   * flagged so it survives `exportEncrypted` / `importEncrypted`
+   * round-trips but is NOT re-derivable from the mnemonic — calling
+   * `importMnemonic` afterwards overwrites every stored key with the
+   * mnemonic-derived set, which will drop imported keys. This mirrors
+   * how MetaMask / Phantom handle "imported accounts".
+   *
+   * Fails with `KeyGenerationError` if the chain is missing from
+   * config, the private key length is wrong for the chain's curve, or
+   * a key already exists for that chain and `overwrite` is not set.
+   */
+  readonly importPrivateKey: (
+    chain: ChainId,
+    privateKey: Uint8Array,
+    options?: { readonly overwrite?: boolean },
+  ) => Effect.Effect<
+    DerivedKey,
     KeyGenerationError | StorageError,
     StorageAdapter | WalletConfigService
   >
@@ -237,6 +267,72 @@ export const KeyringServiceLive = Layer.succeed(
         yield* storage.save(STORAGE_KEYS.mnemonic, textEncoder.encode(phrase))
         yield* saveStoredKeys(storage, stored)
         return stored.map(toDerivedKey)
+      }),
+
+    importPrivateKey: (chain, privateKey, options) =>
+      Effect.gen(function* () {
+        const configService = yield* WalletConfigService
+        const storage = yield* StorageAdapter
+        const chainConfig = configService.config.chains.find(
+          (c) => c.chainId === chain,
+        )
+        if (!chainConfig) {
+          return yield* Effect.fail(
+            new KeyGenerationError({
+              message: `Chain ${String(chain)} is not in WalletConfig.chains — add it before importing a key`,
+            }),
+          )
+        }
+        // Both supported curves use 32-byte private keys (ed25519 seed /
+        // secp256k1 scalar). Reject anything else up-front so the caller
+        // gets a clean error instead of a cryptic noble-curves stack.
+        if (privateKey.length !== 32) {
+          return yield* Effect.fail(
+            new KeyGenerationError({
+              message: `Private key must be 32 bytes, got ${privateKey.length}`,
+            }),
+          )
+        }
+        let publicKey: Uint8Array
+        let address: string
+        try {
+          publicKey = publicKeyForChain(String(chain), privateKey)
+          address = deriveAddressForChain(String(chain), publicKey)
+        } catch (e) {
+          return yield* Effect.fail(
+            new KeyGenerationError({
+              message: `Failed to derive address for ${String(chain)}: ${
+                (e as Error).message
+              }`,
+            }),
+          )
+        }
+
+        const existing = yield* loadStoredKeys(storage)
+        if (existing.some((k) => k.chain === chain) && !options?.overwrite) {
+          return yield* Effect.fail(
+            new KeyGenerationError({
+              message: `A key for ${String(chain)} already exists — pass { overwrite: true } to replace it`,
+            }),
+          )
+        }
+        const stored: StoredDerivedKey = {
+          chain,
+          path: IMPORTED_PATH,
+          publicKeyHex: bytesToHex(publicKey),
+          address,
+          privateKeyHex: bytesToHex(privateKey),
+          imported: true,
+        }
+        // Keep every other chain's key untouched; replace (or append)
+        // only the entry for this chain.
+        const next = existing
+          .filter((k) => k.chain !== chain)
+          .concat(stored)
+        yield* saveStoredKeys(storage, next)
+        // Curve check for sanity (matches what signBytes will expect).
+        curveFor(String(chain))
+        return toDerivedKey(stored)
       }),
 
     getKey: (chain) =>
