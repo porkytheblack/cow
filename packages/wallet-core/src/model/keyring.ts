@@ -8,6 +8,8 @@ export interface Mnemonic {
 export interface DerivationPath {
   readonly chain: ChainId
   readonly path: string
+  /** BIP-44 account index within the path (0-based). */
+  readonly accountIndex: number
 }
 
 export interface DerivedKey {
@@ -15,6 +17,8 @@ export interface DerivedKey {
   readonly publicKey: Uint8Array
   readonly address: string
   readonly path: DerivationPath
+  /** BIP-44 account index — shorthand for `path.accountIndex`. */
+  readonly accountIndex: number
 }
 
 /**

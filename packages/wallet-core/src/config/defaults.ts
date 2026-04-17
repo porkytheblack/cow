@@ -66,3 +66,19 @@ export const USDC_ASSETS: Partial<Record<ChainId, AssetId>> = {
 
 export const DEFAULT_CCTP_POLL_INTERVAL_MS = 2_000
 export const DEFAULT_CCTP_TIMEOUT_MS = 30 * 60_000
+
+/**
+ * Default CCTP version per chain. Aptos is V1; all EVM chains are V2.
+ * Consumers can override per-chain via
+ * `WalletConfig.cctp.contractAddresses[chainId].version`.
+ */
+export const CCTP_VERSIONS: Partial<Record<ChainId, "v1" | "v2">> = {
+  "evm:1": "v2",
+  "evm:43114": "v2",
+  "evm:10": "v2",
+  "evm:42161": "v2",
+  "evm:8453": "v2",
+  "evm:11155111": "v2",
+  solana: "v1",
+  aptos: "v1",
+}

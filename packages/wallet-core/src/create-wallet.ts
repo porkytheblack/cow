@@ -7,8 +7,8 @@ import { BrowserFetchAdapter } from "./adapters/fetch/browser.js"
 import { FetchAdapter } from "./adapters/fetch/index.js"
 import { StorageAdapter } from "./adapters/storage/index.js"
 import { InMemoryStorageAdapter } from "./adapters/storage/memory.js"
-import { makeWalletConfigLayer, WalletConfigService } from "./config/index.js"
-import type { WalletConfig } from "./config/index.js"
+import { makeWalletConfigLayer, resolveConfig, WalletConfigService } from "./config/index.js"
+import type { WalletConfig, WalletConfigInput } from "./config/index.js"
 import { AuthGateService, TestAuthGate } from "./services/auth-gate.js"
 import { BalanceService, BalanceServiceLive } from "./services/balance.js"
 import { BroadcastService, BroadcastServiceLive } from "./services/broadcast.js"
@@ -59,9 +59,10 @@ export type WalletLayer = Layer.Layer<
  *   chainRegistry -> ChainAdapterRegistryLive (reads config.chains)
  */
 export const createWallet = (
-  config: WalletConfig,
+  configInput: WalletConfig | WalletConfigInput,
   overrides?: WalletAdapterOverrides,
 ): WalletLayer => {
+  const config = resolveConfig(configInput as WalletConfigInput)
   const configLayer = makeWalletConfigLayer(config)
   const fetchLayer = overrides?.fetch ?? BrowserFetchAdapter
   const storageLayer = overrides?.storage ?? InMemoryStorageAdapter

@@ -32,6 +32,25 @@ export const curveFor = (chain: string): ChainCurve => {
 }
 
 /**
+ * Given a BIP-44 derivation path template (e.g. `m/44'/60'/0'/0/0`)
+ * and an account index, replace the account segment (position 2) with
+ * the requested index, preserving the hardened marker if present.
+ *
+ *   derivePathForAccount("m/44'/60'/0'/0/0", 3) → "m/44'/60'/3'/0/0"
+ */
+export const derivePathForAccount = (
+  basePath: string,
+  accountIndex: number,
+): string => {
+  if (!basePath.startsWith("m/")) return basePath
+  const segments = basePath.slice(2).split("/")
+  if (segments.length < 3) return basePath
+  const hardened = segments[2]!.endsWith("'")
+  segments[2] = `${accountIndex}${hardened ? "'" : ""}`
+  return "m/" + segments.join("/")
+}
+
+/**
  * BIP-39 mnemonic generation and validation.
  */
 export const generateMnemonic = (strength: 128 | 256): string =>
@@ -133,7 +152,16 @@ export const deriveKeypair = (
   return { chain, path, privateKey, publicKey, address }
 }
 
-const deriveAddressForChain = (chain: string, publicKey: Uint8Array): string => {
+/**
+ * Compute the on-chain address for a given chain + public key. Exposed
+ * so `KeyringService.importPrivateKey` can validate an imported key
+ * and surface its derived address without going through a full
+ * mnemonic derivation.
+ */
+export const deriveAddressForChain = (
+  chain: string,
+  publicKey: Uint8Array,
+): string => {
   if (chain === "aptos") {
     // Aptos AuthenticationKey = sha3_256(pubkey || scheme_byte).
     // scheme_byte = 0x00 for single-signer Ed25519.
