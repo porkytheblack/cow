@@ -131,6 +131,9 @@ export const TransferServiceLive = Layer.succeed(TransferService, {
             planId: plan.id,
             status: "awaiting-attestation",
             burn: burnMsg,
+            sourceChain: String(step.sourceChain),
+            destChain: String(step.destChain),
+            recipient: intent.to.address,
             createdAt: Date.now(),
             updatedAt: Date.now(),
           }

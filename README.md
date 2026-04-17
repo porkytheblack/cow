@@ -1,6 +1,6 @@
 # COW - COol Wallet
 
-A multichain wallet library built on Effect TS. Supports **Aptos**, **Solana**, and **EVM** chains with **CCTP V2** cross-chain USDC transfers.
+A multichain wallet library built on Effect TS. Supports **Aptos**, **Solana**, and **EVM** chains with **CCTP V1/V2** cross-chain USDC transfers.
 
 Two entry points: a **promise-based client** for app developers and an **Effect TS layer** for advanced composition.
 
@@ -90,6 +90,60 @@ const plan = await wallet.planTransfer(intent)
 console.log(plan.isCrossChain, plan.steps.map(s => s.type))
 ```
 
+### Auth Sessions (multi-transaction flows)
+
+By default every `transfer()` / `sign()` call prompts the user for approval. For multi-step flows (batch sends, CCTP cross-chain) you can approve once at the top:
+
+```typescript
+// Prompt the user once
+await wallet.approveSession("Send USDC to 3 recipients")
+
+// These all auto-approve — no additional prompts
+await wallet.transfer(intent1)
+await wallet.transfer(intent2)
+await wallet.transfer(intent3)
+
+// Done — end the session so the next call prompts again
+await wallet.endSession()
+```
+
+Sessions are time-bounded (`auth.sessionTtlMs`, default 5 minutes) and level-aware: an `"elevated"` session (the default) covers both elevated and standard requests. A `"standard"` session only covers standard — high-value transactions still prompt.
+
+```typescript
+// Standard session — only covers low-value ops
+await wallet.approveSession("View balances", "standard")
+
+// Elevated session — covers everything (default)
+await wallet.approveSession("Portfolio rebalance")
+
+// Check session status
+await wallet.hasActiveSession() // true/false
+```
+
+This works across CCTP cross-chain transfers too — the burn and mint are signed in the same session even though the attestation wait can take minutes.
+
+### Resuming Interrupted Transfers
+
+Cross-chain CCTP transfers can take 2-15 minutes (attestation polling). If the app closes mid-transfer, the state is persisted automatically. On restart:
+
+```typescript
+// Check for interrupted transfers
+const pending = await wallet.listPendingTransfers()
+
+for (const t of pending) {
+  if (t.status !== "completed" && t.status !== "failed") {
+    console.log(`Resuming: ${t.sourceChain} -> ${t.destChain}, status: ${t.status}`)
+    const { mintReceipt } = await wallet.resumeTransfer(t.id)
+    console.log(`Completed: ${mintReceipt.hash}`)
+  }
+}
+```
+
+`resumeTransfer(id)` picks up from the last saved step:
+- If the burn succeeded but attestation wasn't received yet → re-polls Circle's API
+- If the attestation was received but the mint wasn't submitted → builds + signs + broadcasts the mint
+- The `recipient`, `destChain`, and `sourceChain` are all stored in the record automatically — no need to remember them.
+
 ### Amount Helpers
 
 ```typescript
@@ -148,7 +202,7 @@ try {
       console.log(`User denied: ${e.reason}`)
       break
     case "CctpAttestationTimeout":
-      // Can resume later with wallet.resumeCctpTransfer(id, recipient, destChain)
+      // Can resume later with wallet.resumeTransfer(t.id)
       break
   }
 }
@@ -156,11 +210,41 @@ try {
 
 All error types: `KeyGenerationError`, `KeyNotFoundError`, `AuthDeniedError`, `AuthTimeoutError`, `InsufficientBalanceError`, `BroadcastError`, `FeeEstimationError`, `CctpAttestationTimeout`, `CctpMintError`, `UnsupportedChainError`, `UnsupportedRouteError`, `StorageError`, `BackupError`, `BackupDecryptionError`, `FetchError`.
 
+### Config Defaults
+
+Only `chains` is required. Everything else gets sensible defaults:
+
+```typescript
+// This is all you need for development:
+const wallet = createWalletClient({
+  chains: [
+    { chainId: "evm:1", kind: "evm", name: "Ethereum", rpcUrl: "https://...",
+      nativeAsset: { chain: "evm:1", type: "native", symbol: "ETH", decimals: 18 } },
+  ],
+})
+// cctp     -> attestationApiUrl: "https://iris-api.circle.com/v2", poll every 2s, 30 min timeout
+// auth     -> elevatedThreshold: 100_000_000n, sessionTtl: 5 min, pinMinLength: 4
+// keyring  -> 12-word mnemonic, standard BIP-44 derivation paths for configured chains
+```
+
+For full control, pass the complete `WalletConfig`. See [guides/COW_AGENT_SKILL.md](guides/COW_AGENT_SKILL.md) for all fields.
+
+### Cleanup
+
+```typescript
+// Tear down the runtime when the wallet instance is no longer needed
+await wallet.dispose()
+```
+
 ## Production Setup
 
-### Authentication
+**The library warns at startup if you're using dangerous defaults:**
+- `[cow] No storage adapter provided` — keys are in-memory, lost on refresh
+- `[cow] No auth gate provided` — transactions auto-approve without user confirmation
 
-The default auth gate auto-approves everything (for development). Wire a real one for production:
+Wire production adapters to silence these and make the wallet safe:
+
+### Authentication
 
 **Browser (WebAuthn passkeys):**
 ```typescript

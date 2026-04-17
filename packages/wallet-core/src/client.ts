@@ -2,7 +2,9 @@ import { Effect, ManagedRuntime } from "effect"
 import type { AssetId } from "./model/asset.js"
 import type { Portfolio, TokenBalance } from "./model/balance.js"
 import type { ChainId } from "./model/chain.js"
+import type { AuthApproval } from "./model/auth.js"
 import type { DerivedKey, Mnemonic } from "./model/keyring.js"
+import type { PendingCctpTransfer } from "./model/cctp.js"
 import type { SignedTx, TxReceipt, UnsignedTx } from "./model/transaction.js"
 import type { TransferIntent, TransferPlan } from "./model/transfer.js"
 import type { WalletConfig, WalletConfigInput } from "./config/index.js"
@@ -89,10 +91,35 @@ export interface WalletClient {
 
   // --- CCTP -----------------------------------------------------------
 
+  /**
+   * List all pending (incomplete) CCTP transfers that were persisted
+   * to storage. Call on app startup to discover transfers that were
+   * interrupted mid-flight and resume them.
+   */
+  listPendingTransfers(): Promise<readonly PendingCctpTransfer[]>
+
+  /**
+   * Resume a pending CCTP transfer by id. Picks up from whichever
+   * step was last persisted — waits for attestation if needed, then
+   * builds + signs + broadcasts the mint on the destination chain.
+   *
+   * `recipient` and `destChain` are read from the stored record
+   * automatically (they were saved at burn time). Override them only
+   * if you need to redirect the mint to a different address.
+   */
+  resumeTransfer(
+    id: string,
+    recipient?: string,
+    destChain?: ChainId,
+  ): Promise<ResumeResult>
+
+  /**
+   * @deprecated Use `resumeTransfer` instead.
+   */
   resumeCctpTransfer(
     id: string,
-    recipient: string,
-    destChain: ChainId,
+    recipient?: string,
+    destChain?: ChainId,
   ): Promise<ResumeResult>
 
   // --- Backup ---------------------------------------------------------
@@ -105,6 +132,29 @@ export interface WalletClient {
   deriveEncryptionKey(): Promise<Uint8Array>
 
   // --- Escape hatch ---------------------------------------------------
+
+  // --- Sessions --------------------------------------------------------
+
+  /**
+   * Prompt the user once and start an approval session. Subsequent
+   * `sign()` / `transfer()` calls at the same or lower auth level
+   * will auto-approve without another prompt until the session
+   * expires (`auth.sessionTtlMs`) or `endSession()` is called.
+   *
+   * ```ts
+   * await wallet.approveSession("Batch send to 3 addresses")
+   * await wallet.transfer(intent1) // no prompt
+   * await wallet.transfer(intent2) // no prompt
+   * await wallet.transfer(intent3) // no prompt
+   * await wallet.endSession()
+   * ```
+   */
+  approveSession(
+    reason: string,
+    level?: "standard" | "elevated",
+  ): Promise<AuthApproval>
+  endSession(): Promise<void>
+  hasActiveSession(): Promise<boolean>
 
   // --- Utilities -------------------------------------------------------
 
@@ -299,6 +349,22 @@ export const createWalletClient = (
 
     // --- CCTP ----------------------------------------------------------
 
+    listPendingTransfers: () =>
+      run(
+        Effect.gen(function* () {
+          const cctp = yield* CctpService
+          return yield* cctp.loadPending()
+        }),
+      ),
+
+    resumeTransfer: (id, recipient, destChain) =>
+      run(
+        Effect.gen(function* () {
+          const cctp = yield* CctpService
+          return yield* cctp.resumePending(id, recipient, destChain)
+        }),
+      ),
+
     resumeCctpTransfer: (id, recipient, destChain) =>
       run(
         Effect.gen(function* () {
@@ -330,6 +396,32 @@ export const createWalletClient = (
         Effect.gen(function* () {
           const auth = yield* AuthGateService
           return yield* auth.deriveEncryptionKey()
+        }),
+      ),
+
+    // --- Sessions --------------------------------------------------------
+
+    approveSession: (reason, level) =>
+      run(
+        Effect.gen(function* () {
+          const auth = yield* AuthGateService
+          return yield* auth.beginSession(reason, level)
+        }),
+      ),
+
+    endSession: () =>
+      run(
+        Effect.gen(function* () {
+          const auth = yield* AuthGateService
+          yield* auth.endSession()
+        }),
+      ),
+
+    hasActiveSession: () =>
+      run(
+        Effect.gen(function* () {
+          const auth = yield* AuthGateService
+          return yield* auth.hasActiveSession()
         }),
       ),
 

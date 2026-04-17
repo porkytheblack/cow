@@ -73,7 +73,7 @@ export { makeAptosChainAdapter } from "./adapters/chain/aptos.js"
 export { jsonRpcCall } from "./adapters/chain/json-rpc.js"
 
 // Services
-export { AuthGateService, TestAuthGate, DenyingAuthGate } from "./services/auth-gate.js"
+export { AuthGateService, TestAuthGate, DenyingAuthGate, withSessionSupport } from "./services/auth-gate.js"
 export {
   makeCallbackAuthGate,
   deriveEncryptionKeyFromSecret,

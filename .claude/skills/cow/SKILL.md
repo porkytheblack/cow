@@ -45,7 +45,7 @@ await Effect.runPromise(Effect.provide(program, layer))
 
 ## Minimal WalletConfig
 
-Every wallet needs this config. All fields are required:
+Only `chains` is required. `cctp`, `auth`, and `keyring` all have sensible defaults and can be omitted or partially overridden:
 
 ```typescript
 const config: WalletConfig = {
@@ -101,13 +101,26 @@ wallet.planTransfer(intent)                           // -> TransferPlan (dry-ru
 wallet.sign(unsignedTx)                               // -> SignedTx
 wallet.broadcast(signedTx)                            // -> TxReceipt
 
-// CCTP resume
-wallet.resumeCctpTransfer(id, recipient, destChain)   // -> ResumeResult
+// CCTP resume (after app restart mid-transfer)
+wallet.listPendingTransfers()                          // -> PendingCctpTransfer[]
+wallet.resumeTransfer(id)                              // -> ResumeResult (reads recipient/destChain from record)
+wallet.resumeTransfer(id, recipient, destChain)        // -> ResumeResult (explicit override)
+
+// Sessions (multi-tx flows — approve once, sign many)
+wallet.approveSession(reason, level?)                  // -> AuthApproval (prompts once)
+wallet.endSession()                                    // -> void
+wallet.hasActiveSession()                              // -> boolean
 
 // Backup
 wallet.exportBackup(encryptionKey)                    // -> Uint8Array
 wallet.importBackup(bundle, encryptionKey)            // -> DerivedKey[]
 wallet.deriveEncryptionKey()                          // -> Uint8Array
+
+// Utilities
+wallet.parseUnits("10.5", 6)                          // -> 10_500_000n
+wallet.formatUnits(10_500_000n, 6)                    // -> "10.5"
+wallet.asset("USDC", "evm:1")                         // -> AssetId | undefined
+wallet.dispose()                                      // -> void (cleanup)
 
 // Escape hatch
 wallet.layer                                          // -> WalletLayer (Effect)
@@ -177,6 +190,29 @@ await wallet.transfer({
   amount: 50_000_000n,
 })
 // burn -> poll attestation -> mint, all automatic
+```
+
+### Auth session for multi-tx flow
+
+```typescript
+await wallet.approveSession("Batch transfer to 5 recipients")
+for (const intent of intents) {
+  await wallet.transfer(intent)  // auto-approved
+}
+await wallet.endSession()
+```
+
+Sessions span CCTP cross-chain too (burn + attestation wait + mint all signed under one session). Default TTL: `auth.sessionTtlMs`. `"elevated"` (default) covers all request levels.
+
+### Resume interrupted CCTP transfers on app startup
+
+```typescript
+const pending = await wallet.listPendingTransfers()
+for (const t of pending) {
+  if (t.status !== "completed" && t.status !== "failed") {
+    await wallet.resumeTransfer(t.id) // reads recipient/destChain from record
+  }
+}
 ```
 
 ### Backup + restore

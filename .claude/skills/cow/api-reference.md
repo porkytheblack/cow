@@ -6,8 +6,9 @@ Complete type signatures for `cow-wallet`.
 
 ```typescript
 // Promise API — no Effect knowledge needed
+// Accepts WalletConfig (full) or WalletConfigInput (minimal — only chains required)
 function createWalletClient(
-  config: WalletConfig,
+  config: WalletConfig | WalletConfigInput,
   overrides?: WalletAdapterOverrides,
 ): WalletClient
 
@@ -215,6 +216,16 @@ type CctpTransferStatus =
   | "burning" | "awaiting-attestation" | "attested"
   | "minting" | "completed" | "failed"
 
+interface WalletConfigInput {
+  readonly chains: readonly ChainConfig[]
+  readonly cctp?: Partial<CctpConfig>
+  readonly auth?: Partial<AuthConfig>
+  readonly keyring?: Partial<KeyringConfig>
+  readonly [key: string]: unknown
+}
+
+function resolveConfig(input: WalletConfigInput): WalletConfig
+
 interface PendingCctpTransfer {
   readonly id: string
   readonly planId: string
@@ -222,6 +233,9 @@ interface PendingCctpTransfer {
   readonly burn?: BurnMessage
   readonly attestation?: Attestation
   readonly mintTxHash?: string
+  readonly sourceChain?: string   // persisted at burn time
+  readonly destChain?: string     // persisted at burn time
+  readonly recipient?: string     // persisted at burn time
   readonly createdAt: number
   readonly updatedAt: number
 }
@@ -362,6 +376,28 @@ const USDC_ASSETS: Partial<Record<ChainId, AssetId>> = {
 
 const DEFAULT_CCTP_POLL_INTERVAL_MS = 2_000
 const DEFAULT_CCTP_TIMEOUT_MS = 1_800_000
+```
+
+## Session support (Effect layer)
+
+```typescript
+// Wrap any auth gate with session caching
+function withSessionSupport(
+  innerGate: AuthGateServiceShape,
+  sessionTtlMs: number,
+): Effect.Effect<AuthGateServiceShape>
+
+// AuthGateServiceShape additions
+beginSession(reason: string, level?: AuthLevel): Effect<AuthApproval, AuthDeniedError | AuthTimeoutError>
+endSession(): Effect<void>
+hasActiveSession(): Effect<boolean>
+```
+
+## Defaults
+
+```typescript
+const CCTP_VERSIONS: Partial<Record<ChainId, "v1" | "v2">>
+// { "evm:1": "v2", "evm:8453": "v2", ..., aptos: "v1", solana: "v1" }
 ```
 
 ## Effect service tags (for advanced users)

@@ -3,7 +3,7 @@ import { hkdf } from "@noble/hashes/hkdf"
 import { sha256 } from "@noble/hashes/sha256"
 import type { AuthApproval, AuthMethod, AuthRequest } from "../model/auth.js"
 import { AuthDeniedError, AuthTimeoutError } from "../model/errors.js"
-import { AuthGateService } from "./auth-gate.js"
+import { AuthGateService, withSessionSupport } from "./auth-gate.js"
 
 /**
  * CallbackAuthGate — bridges `AuthGateService` to caller-supplied
@@ -39,6 +39,8 @@ export interface CallbackAuthGateHooks {
   readonly registerPasskey?: (credential: unknown) => Promise<void>
   readonly registerPin?: (pinHash: Uint8Array) => Promise<void>
   readonly timeoutMs?: number
+  /** How long a session started by `beginSession()` lasts. Default 5 min. */
+  readonly sessionTtlMs?: number
 }
 
 const withTimeout = <A, E1, E2>(
@@ -57,9 +59,10 @@ export const makeCallbackAuthGate = (
   hooks: CallbackAuthGateHooks,
 ): Layer.Layer<AuthGateService> => {
   const timeoutMs = hooks.timeoutMs ?? 5 * 60_000
+  const sessionTtlMs = hooks.sessionTtlMs ?? 5 * 60_000
 
-  return Layer.succeed(AuthGateService, {
-    requestApproval: (request) =>
+  const innerGate = {
+    requestApproval: (request: AuthRequest) =>
       withTimeout(
         Effect.tryPromise({
           try: () => hooks.promptApproval(request),
@@ -80,13 +83,13 @@ export const makeCallbackAuthGate = (
         () => new AuthTimeoutError({ reason: `approval prompt timed out after ${timeoutMs}ms` }),
       ),
 
-    registerPasskey: (credential) =>
+    registerPasskey: (credential: unknown) =>
       Effect.tryPromise({
         try: () => hooks.registerPasskey?.(credential) ?? Promise.resolve(),
         catch: () => undefined,
       }).pipe(Effect.catchAll(() => Effect.void), Effect.asVoid),
 
-    registerPin: (pinHash) =>
+    registerPin: (pinHash: Uint8Array) =>
       Effect.tryPromise({
         try: () => hooks.registerPin?.(pinHash) ?? Promise.resolve(),
         catch: () => undefined,
@@ -107,7 +110,14 @@ export const makeCallbackAuthGate = (
             reason: `encryption-key derivation timed out after ${timeoutMs}ms`,
           }),
       ),
-  })
+
+    // Stubs — withSessionSupport replaces these with real impls.
+    beginSession: () => innerGate.requestApproval({ reason: "session", requiredLevel: "elevated" }),
+    endSession: () => Effect.void,
+    hasActiveSession: () => Effect.succeed(false),
+  }
+
+  return Layer.effect(AuthGateService, withSessionSupport(innerGate, sessionTtlMs))
 }
 
 /**

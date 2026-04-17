@@ -106,7 +106,19 @@ interface WalletClient {
   broadcast(signed: SignedTx): Promise<TxReceipt>
 
   // CCTP resume (after app restart mid-transfer)
-  resumeCctpTransfer(id: string, recipient: string, destChain: ChainId): Promise<ResumeResult>
+  listPendingTransfers(): Promise<readonly PendingCctpTransfer[]>
+  resumeTransfer(id: string, recipient?: string, destChain?: ChainId): Promise<ResumeResult>
+
+  // Sessions (approve once, sign many)
+  approveSession(reason: string, level?: "standard" | "elevated"): Promise<AuthApproval>
+  endSession(): Promise<void>
+  hasActiveSession(): Promise<boolean>
+
+  // Utilities
+  parseUnits(amount: string, decimals: number): bigint
+  formatUnits(amount: bigint, decimals: number): string
+  asset(symbol: string, chain: ChainId): AssetId | undefined
+  dispose(): Promise<void>
 
   // Backup
   exportBackup(encryptionKey: Uint8Array): Promise<Uint8Array>
@@ -240,9 +252,37 @@ const result = await wallet.transfer({
 ### Resume a CCTP transfer after app restart
 
 ```typescript
-const { transfer, mintReceipt } = await wallet.resumeCctpTransfer(
-  pendingId, recipientAddress, "evm:8453"
-)
+// On app startup — check for interrupted transfers
+const pending = await wallet.listPendingTransfers()
+for (const t of pending) {
+  if (t.status !== "completed" && t.status !== "failed") {
+    const { mintReceipt } = await wallet.resumeTransfer(t.id)
+    // recipient + destChain read from the stored record automatically
+  }
+}
+```
+
+### Auth session for batch operations
+
+```typescript
+await wallet.approveSession("Send USDC to 5 recipients")
+for (const intent of intents) {
+  await wallet.transfer(intent) // auto-approved, no extra prompts
+}
+await wallet.endSession()
+```
+
+Sessions span CCTP cross-chain transfers — burn and mint sign within one session. Default `"elevated"` level covers all request levels. TTL is `auth.sessionTtlMs` (default 5 min).
+
+### Resume interrupted CCTP transfers
+
+```typescript
+const pending = await wallet.listPendingTransfers()
+for (const t of pending) {
+  if (t.status !== "completed" && t.status !== "failed") {
+    await wallet.resumeTransfer(t.id) // recipient/destChain from stored record
+  }
+}
 ```
 
 ### Dry-run a transfer (plan without executing)
