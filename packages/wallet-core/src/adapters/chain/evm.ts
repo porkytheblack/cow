@@ -1,5 +1,6 @@
 import { Effect } from "effect"
 import {
+  decodeErrorResult,
   encodeFunctionData,
   keccak256,
   parseTransaction,
@@ -13,6 +14,7 @@ import { secp256k1 } from "@noble/curves/secp256k1"
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils"
 import type { AssetId } from "../../model/asset.js"
 import type { TokenBalance } from "../../model/balance.js"
+import type { CallRequest, CallSimulation } from "../../model/call.js"
 import type { BurnMessage } from "../../model/cctp.js"
 import type { ChainConfig, ChainId } from "../../model/chain.js"
 import type { SignedTx, TxReceipt, UnsignedTx } from "../../model/transaction.js"
@@ -502,6 +504,165 @@ export const makeEvmChainAdapter = (
               ),
             ),
           )
+      }),
+
+    buildCallTx: (req) =>
+      Effect.gen(function* () {
+        if (req.kind !== "evm") {
+          return yield* Effect.fail(
+            new UnsupportedChainError({
+              chain: `EVM adapter received non-EVM CallRequest kind=${req.kind}`,
+            }),
+          )
+        }
+        if (!String(req.chain).startsWith("evm:")) {
+          return yield* Effect.fail(
+            new UnsupportedChainError({
+              chain: `EVM adapter cannot build call for chain ${String(
+                req.chain,
+              )}`,
+            }),
+          )
+        }
+
+        const base: EvmCallPayload = {
+          kind: "contract-call",
+          to: toAddress(req.to),
+          value: req.value ?? 0n,
+          data: (req.data ?? "0x") as Hex,
+          gas: req.gas,
+          maxFeePerGas: req.maxFeePerGas,
+          maxPriorityFeePerGas: req.maxPriorityFeePerGas,
+          gasPrice: req.gasPrice,
+          nonce: req.nonce,
+        }
+
+        const needsRpc =
+          base.gas === undefined ||
+          base.nonce === undefined ||
+          (base.maxFeePerGas === undefined && base.gasPrice === undefined)
+
+        let enriched: EvmCallPayload = base
+        if (needsRpc) {
+          const fetched = yield* enrichPayloadWithFees(base, req.from)
+          // enrichPayloadWithFees overwrites; re-apply caller overrides
+          // so user-supplied gas / fee / nonce win over RPC defaults.
+          enriched = {
+            ...fetched,
+            gas: req.gas ?? fetched.gas,
+            maxFeePerGas: req.maxFeePerGas ?? fetched.maxFeePerGas,
+            maxPriorityFeePerGas:
+              req.maxPriorityFeePerGas ?? fetched.maxPriorityFeePerGas,
+            gasPrice: req.gasPrice ?? fetched.gasPrice,
+            nonce: req.nonce ?? fetched.nonce,
+          }
+        }
+
+        const totalFee =
+          enriched.maxFeePerGas !== undefined
+            ? enriched.gas! * enriched.maxFeePerGas
+            : enriched.gas! * (enriched.gasPrice ?? 0n)
+
+        const tx: UnsignedTx = {
+          chain: chainConfig.chainId,
+          from: req.from,
+          payload: enriched,
+          estimatedFee: totalFee,
+          metadata: {
+            intent:
+              req.label ??
+              `Call ${req.to} on ${String(chainConfig.chainId)}`,
+            createdAt: Date.now(),
+          },
+        }
+        return tx
+      }),
+
+    simulateCall: (req) =>
+      Effect.gen(function* () {
+        if (req.kind !== "evm") {
+          return yield* Effect.fail(
+            new UnsupportedChainError({
+              chain: `EVM adapter received non-EVM CallRequest kind=${req.kind}`,
+            }),
+          )
+        }
+        const callObj: {
+          from: string
+          to: string
+          data: Hex
+          value?: Hex
+        } = {
+          from: req.from,
+          to: req.to,
+          data: (req.data ?? "0x") as Hex,
+        }
+        if (req.value !== undefined && req.value > 0n) {
+          callObj.value = toHex(req.value)
+        }
+
+        // Use a raw RPC call so we can read `error.data` (the revert
+        // payload) — jsonRpcCall collapses the error object into a
+        // message string, which is insufficient for decoding.
+        const json = yield* Effect.gen(function* () {
+          const res = yield* fetcher.request({
+            url: rpcUrl,
+            method: "POST",
+            headers: {
+              "content-type": "application/json",
+              accept: "application/json",
+            },
+            body: JSON.stringify({
+              jsonrpc: "2.0",
+              id: 1,
+              method: "eth_call",
+              params: [callObj, "latest"],
+            }),
+          })
+          return yield* res.json<{
+            result?: string
+            error?: { code: number; message: string; data?: string }
+          }>()
+        }).pipe(Effect.catchAll((cause) => Effect.fail(failEst(cause))))
+
+        if (!json.error && typeof json.result === "string") {
+          return {
+            success: true,
+            returnData: json.result as Hex,
+          } satisfies CallSimulation
+        }
+
+        const err = json.error
+        const dataHex = err?.data
+        let revertReason: string | undefined
+        if (dataHex && dataHex !== "0x") {
+          try {
+            const decoded = decodeErrorResult({
+              abi: [
+                {
+                  type: "error",
+                  name: "Error",
+                  inputs: [{ name: "message", type: "string" }],
+                },
+              ],
+              data: dataHex as Hex,
+            })
+            if (decoded.errorName === "Error") {
+              revertReason = String(decoded.args?.[0] ?? "")
+            } else {
+              revertReason = dataHex
+            }
+          } catch {
+            revertReason = dataHex
+          }
+        } else if (err?.message) {
+          revertReason = err.message
+        }
+        return {
+          success: false,
+          revertReason: revertReason ?? "reverted",
+          raw: err ?? undefined,
+        } satisfies CallSimulation
       }),
 
     buildCctpBurnTx: ({ from, destinationDomain, recipient, amount }) =>

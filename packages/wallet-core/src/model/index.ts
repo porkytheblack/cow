@@ -1,6 +1,7 @@
 export * from "./asset.js"
 export * from "./auth.js"
 export * from "./balance.js"
+export * from "./call.js"
 export * from "./cctp.js"
 export * from "./chain.js"
 export * from "./errors.js"

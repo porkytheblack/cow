@@ -105,6 +105,11 @@ interface WalletClient {
   sign(tx: UnsignedTx): Promise<SignedTx>
   broadcast(signed: SignedTx): Promise<TxReceipt>
 
+  // Arbitrary contract / program / entry-function calls
+  buildCall(req: CallRequest): Promise<UnsignedTx>
+  sendCall(req: CallRequest): Promise<TxReceipt>
+  simulateCall(req: CallRequest): Promise<CallSimulation>
+
   // CCTP resume (after app restart mid-transfer)
   listPendingTransfers(): Promise<readonly PendingCctpTransfer[]>
   resumeTransfer(id: string, recipient?: string, destChain?: ChainId): Promise<ResumeResult>
@@ -291,6 +296,78 @@ for (const t of pending) {
 const plan = await wallet.planTransfer(intent)
 console.log(plan.isCrossChain) // true/false
 console.log(plan.steps)        // [{ type: "direct-transfer", ... }] or [{ type: "cctp-burn" }, { type: "cctp-mint" }]
+```
+
+### Arbitrary contract calls
+
+For anything beyond native / USDC transfers — contract interactions, program invocations, entry functions — use the `CallRequest` APIs. They reuse the same key-isolated signing, auth-gate, and broadcast pipeline as `transfer()`, so sessions, elevated-fee escalation, and promise-shaped errors all behave identically.
+
+```typescript
+import { encodeFunctionData } from "viem"
+
+// EVM: approve USDC for a router contract.
+const data = encodeFunctionData({
+  abi: [{ type: "function", name: "approve", stateMutability: "nonpayable",
+          inputs: [{ name: "s", type: "address" }, { name: "a", type: "uint256" }],
+          outputs: [{ type: "bool" }] }] as const,
+  functionName: "approve",
+  args: ["0xRouter...", 10_000_000n],
+})
+
+const receipt = await wallet.sendCall({
+  kind: "evm",
+  chain: "evm:1",
+  from: evmKey.address,
+  to: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // USDC
+  data,
+  value: 0n,
+  label: "Approve USDC for Router",
+})
+```
+
+```typescript
+// Solana: invoke the Memo program (or any program) with raw instructions.
+const receipt = await wallet.sendCall({
+  kind: "solana",
+  chain: "solana",
+  from: solanaKey.address,
+  instructions: [
+    {
+      programId: "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",
+      keys: [{ pubkey: solanaKey.address, isSigner: true, isWritable: false }],
+      data: new TextEncoder().encode("hello"),
+    },
+  ],
+  label: "Post memo",
+})
+```
+
+```typescript
+// Aptos: call any entry function by fully-qualified path.
+const receipt = await wallet.sendCall({
+  kind: "aptos",
+  chain: "aptos",
+  from: aptosKey.address,
+  function: "0x1::coin::transfer",
+  typeArguments: ["0x1::aptos_coin::AptosCoin"],
+  functionArguments: [recipient, "1000"],
+  label: "Custom APT transfer",
+})
+```
+
+Three methods are available, all with the same `CallRequest`:
+
+- `wallet.buildCall(req)` → `UnsignedTx` — build without signing (useful for fee inspection or deferred signing; then call `wallet.sign()` + `wallet.broadcast()`).
+- `wallet.sendCall(req)` → `TxReceipt` — build + sign + broadcast.
+- `wallet.simulateCall(req)` → `{ success, returnData?, revertReason?, gasUsed?, logs?, raw? }` — dry-run (EVM `eth_call`, Solana `simulateTransaction`, Aptos `simulate.simple`).
+
+Sessions apply identically — wrap many calls under one prompt:
+
+```typescript
+await wallet.approveSession("Interact with Uniswap")
+await wallet.sendCall({ kind: "evm", chain: "evm:1", from, to: router, data: swap1 })
+await wallet.sendCall({ kind: "evm", chain: "evm:1", from, to: router, data: swap2 })
+await wallet.endSession()
 ```
 
 ### Encrypted backup + restore

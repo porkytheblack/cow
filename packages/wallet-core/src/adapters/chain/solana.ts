@@ -9,6 +9,7 @@ import { ed25519 } from "@noble/curves/ed25519"
 import { base58Encode, base58Decode } from "../../services/keyring-crypto.js"
 import type { AssetId } from "../../model/asset.js"
 import type { TokenBalance } from "../../model/balance.js"
+import type { CallRequest, CallSimulation } from "../../model/call.js"
 import type { BurnMessage } from "../../model/cctp.js"
 import type { ChainConfig } from "../../model/chain.js"
 import type { SignedTx, TxReceipt, UnsignedTx } from "../../model/transaction.js"
@@ -115,7 +116,12 @@ const buildSplTransferIx = (params: {
 // --- Payload shape ------------------------------------------------------
 
 interface SolanaPayload {
-  readonly kind: "direct-transfer" | "spl-transfer" | "cctp-burn" | "cctp-mint"
+  readonly kind:
+    | "direct-transfer"
+    | "spl-transfer"
+    | "contract-call"
+    | "cctp-burn"
+    | "cctp-mint"
   /** Base58 recent blockhash — set by buildTransferTx */
   readonly blockhash: string
   readonly lastValidBlockHeight: number
@@ -174,6 +180,16 @@ const base64Encode = (bytes: Uint8Array): string => {
   const b = (globalThis as any).btoa as ((v: string) => string) | undefined
   if (!b) throw new Error("btoa unavailable")
   return b(s)
+}
+
+const base64Decode = (b64: string): Uint8Array => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const a = (globalThis as any).atob as ((v: string) => string) | undefined
+  if (!a) throw new Error("atob unavailable")
+  const binary = a(b64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  return bytes
 }
 
 // --- Factory ------------------------------------------------------------
@@ -357,6 +373,157 @@ export const makeSolanaChainAdapter = (
               ),
             ),
           )
+      }),
+
+    buildCallTx: (req) =>
+      Effect.gen(function* () {
+        if (req.kind !== "solana") {
+          return yield* Effect.fail(
+            new UnsupportedChainError({
+              chain: `Solana adapter received non-Solana CallRequest kind=${req.kind}`,
+            }),
+          )
+        }
+        if (req.instructions.length === 0) {
+          return yield* Effect.fail(
+            new FeeEstimationError({
+              chain: String(chainConfig.chainId),
+              cause: "Solana CallRequest must include at least one instruction",
+            }),
+          )
+        }
+
+        const blockhashRes = yield* rpc<{
+          value: { blockhash: string; lastValidBlockHeight: number }
+        }>("getLatestBlockhash", [{ commitment: "finalized" }]).pipe(
+          Effect.catchAll((cause) =>
+            Effect.fail(
+              new FeeEstimationError({
+                chain: String(chainConfig.chainId),
+                cause,
+              }),
+            ),
+          ),
+        )
+
+        const payload: SolanaPayload = {
+          kind: "contract-call",
+          blockhash: blockhashRes.value.blockhash,
+          lastValidBlockHeight: blockhashRes.value.lastValidBlockHeight,
+          instructions: req.instructions.map((ix) => ({
+            programId: ix.programId,
+            keys: ix.keys.map((k) => ({
+              pubkey: k.pubkey,
+              isSigner: k.isSigner,
+              isWritable: k.isWritable,
+            })),
+            dataBase58: base58Encode(ix.data),
+          })),
+          feePayer: req.from,
+        }
+
+        const tx: UnsignedTx = {
+          chain: chainConfig.chainId,
+          from: req.from,
+          payload,
+          estimatedFee: 5_000n,
+          metadata: {
+            intent:
+              req.label ??
+              `Call ${req.instructions.length} instruction(s) on ${String(
+                chainConfig.chainId,
+              )}`,
+            createdAt: Date.now(),
+          },
+        }
+        return tx
+      }),
+
+    simulateCall: (req) =>
+      Effect.gen(function* () {
+        if (req.kind !== "solana") {
+          return yield* Effect.fail(
+            new UnsupportedChainError({
+              chain: `Solana adapter received non-Solana CallRequest kind=${req.kind}`,
+            }),
+          )
+        }
+
+        const blockhashRes = yield* rpc<{
+          value: { blockhash: string; lastValidBlockHeight: number }
+        }>("getLatestBlockhash", [{ commitment: "finalized" }]).pipe(
+          Effect.catchAll((cause) =>
+            Effect.fail(
+              new FeeEstimationError({
+                chain: String(chainConfig.chainId),
+                cause,
+              }),
+            ),
+          ),
+        )
+
+        const solTx = new Transaction()
+        solTx.recentBlockhash = blockhashRes.value.blockhash
+        solTx.lastValidBlockHeight = blockhashRes.value.lastValidBlockHeight
+        solTx.feePayer = new PublicKey(req.from)
+        for (const ix of req.instructions) {
+          solTx.add(
+            new TransactionInstruction({
+              programId: new PublicKey(ix.programId),
+              keys: ix.keys.map((k) => ({
+                pubkey: new PublicKey(k.pubkey),
+                isSigner: k.isSigner,
+                isWritable: k.isWritable,
+              })),
+              data: asBuffer(ix.data),
+            }),
+          )
+        }
+        const rawBytes = new Uint8Array(
+          solTx.serialize({
+            verifySignatures: false,
+            requireAllSignatures: false,
+          }),
+        )
+        const rawB64 = base64Encode(rawBytes)
+
+        const sim = yield* rpc<{
+          value: {
+            err: unknown
+            logs?: readonly string[]
+            unitsConsumed?: number
+            returnData?: { data?: readonly [string, string] } | null
+          }
+        }>("simulateTransaction", [
+          rawB64,
+          { encoding: "base64", sigVerify: false, replaceRecentBlockhash: true },
+        ]).pipe(
+          Effect.catchAll((cause) =>
+            Effect.fail(
+              new FeeEstimationError({
+                chain: String(chainConfig.chainId),
+                cause,
+              }),
+            ),
+          ),
+        )
+
+        const v = sim.value
+        const success = v.err === null || v.err === undefined
+        const returnDataB64 = v.returnData?.data?.[0]
+        return {
+          success,
+          returnData: returnDataB64 ? base64Decode(returnDataB64) : undefined,
+          gasUsed:
+            v.unitsConsumed !== undefined ? BigInt(v.unitsConsumed) : undefined,
+          revertReason: success
+            ? undefined
+            : typeof v.err === "string"
+              ? v.err
+              : JSON.stringify(v.err),
+          logs: v.logs,
+          raw: v,
+        } satisfies CallSimulation
       }),
 
     buildCctpBurnTx: (_params) =>

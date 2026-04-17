@@ -1,6 +1,7 @@
 import { Effect, ManagedRuntime } from "effect"
 import type { AssetId } from "./model/asset.js"
 import type { Portfolio, TokenBalance } from "./model/balance.js"
+import type { CallRequest, CallSimulation } from "./model/call.js"
 import type { ChainId } from "./model/chain.js"
 import type { AuthApproval } from "./model/auth.js"
 import type { DerivedKey, Mnemonic } from "./model/keyring.js"
@@ -15,6 +16,7 @@ import { KeyringService } from "./services/keyring.js"
 import { SignerService } from "./services/signer.js"
 import { BroadcastService } from "./services/broadcast.js"
 import { BalanceService } from "./services/balance.js"
+import { CallService } from "./services/call.js"
 import { RouterService } from "./services/router.js"
 import { CctpService, type ResumeResult } from "./services/cctp.js"
 import { TransferService, type TransferResult } from "./services/transfer.js"
@@ -88,6 +90,40 @@ export interface WalletClient {
 
   sign(tx: UnsignedTx): Promise<SignedTx>
   broadcast(signed: SignedTx): Promise<TxReceipt>
+
+  // --- Arbitrary calls -----------------------------------------------
+
+  /**
+   * Build an `UnsignedTx` for an arbitrary contract call / entry-function
+   * invocation without signing or broadcasting. Useful for callers that
+   * want to inspect the estimated fee, attach metadata, or sign in a
+   * separate step.
+   *
+   * ```ts
+   * const tx = await wallet.buildCall({
+   *   kind: "evm",
+   *   chain: "evm:1",
+   *   from: key.address,
+   *   to: "0x...router",
+   *   data: encodeFunctionData({ abi, functionName, args }),
+   *   value: 0n,
+   * })
+   * ```
+   */
+  buildCall(req: CallRequest): Promise<UnsignedTx>
+
+  /**
+   * Happy-path one-shot: build → sign (with auth gate) → broadcast.
+   * Sessions (`approveSession`) apply identically to `transfer()`.
+   */
+  sendCall(req: CallRequest): Promise<TxReceipt>
+
+  /**
+   * Dry-run a call before signing. Returns `success: true` with
+   * `returnData` on success, `success: false` with `revertReason` on
+   * revert.
+   */
+  simulateCall(req: CallRequest): Promise<CallSimulation>
 
   // --- CCTP -----------------------------------------------------------
 
@@ -344,6 +380,32 @@ export const createWalletClient = (
         Effect.gen(function* () {
           const svc = yield* BroadcastService
           return yield* svc.submit(signed)
+        }),
+      ),
+
+    // --- Arbitrary calls -----------------------------------------------
+
+    buildCall: (req) =>
+      run(
+        Effect.gen(function* () {
+          const svc = yield* CallService
+          return yield* svc.build(req)
+        }),
+      ),
+
+    sendCall: (req) =>
+      run(
+        Effect.gen(function* () {
+          const svc = yield* CallService
+          return yield* svc.execute(req)
+        }),
+      ),
+
+    simulateCall: (req) =>
+      run(
+        Effect.gen(function* () {
+          const svc = yield* CallService
+          return yield* svc.simulate(req)
         }),
       ),
 

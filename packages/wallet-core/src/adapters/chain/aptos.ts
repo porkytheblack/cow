@@ -15,6 +15,7 @@ import { bytesToHex, hexToBytes } from "@noble/hashes/utils"
 import { sha3_256 } from "@noble/hashes/sha3"
 import type { AssetId } from "../../model/asset.js"
 import type { TokenBalance } from "../../model/balance.js"
+import type { CallRequest, CallSimulation } from "../../model/call.js"
 import type { BurnMessage } from "../../model/cctp.js"
 import type { ChainConfig } from "../../model/chain.js"
 import type { SignedTx, TxReceipt, UnsignedTx } from "../../model/transaction.js"
@@ -49,7 +50,12 @@ const DEFAULT_APTOS_USDC_METADATA =
   "0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b"
 
 interface AptosPayload {
-  readonly kind: "direct-transfer" | "fungible-transfer" | "cctp-burn" | "cctp-mint"
+  readonly kind:
+    | "direct-transfer"
+    | "fungible-transfer"
+    | "entry-function"
+    | "cctp-burn"
+    | "cctp-mint"
   /**
    * BCS-serialized Aptos `RawTransaction` bytes (hex). Re-hydrated into
    * a `SimpleTransaction` at signing and broadcast time.
@@ -287,6 +293,131 @@ export const makeAptosChainAdapter = (
             ),
           )
       }),
+
+    buildCallTx: (req) =>
+      req.kind !== "aptos"
+        ? Effect.fail(
+            new UnsupportedChainError({
+              chain: `Aptos adapter received non-Aptos CallRequest kind=${req.kind}`,
+            }),
+          )
+        : Effect.tryPromise({
+            try: async () => {
+              const senderAddr = AccountAddress.fromString(req.from)
+              const txn = await aptosClient.transaction.build.simple({
+                sender: senderAddr,
+                withFeePayer: sponsored,
+                data: {
+                  function: req.function,
+                  typeArguments: req.typeArguments
+                    ? [...req.typeArguments]
+                    : undefined,
+                  // The SDK's union is internal; the caller chose the
+                  // types they're passing. Cast through unknown so we
+                  // don't have to mirror the SDK's full type set here.
+                  functionArguments: [
+                    ...req.functionArguments,
+                  ] as unknown as Parameters<
+                    typeof aptosClient.transaction.build.simple
+                  >[0]["data"] extends { functionArguments: infer A }
+                    ? A
+                    : never,
+                },
+              })
+              const rawBytes = txn.rawTransaction.bcsToBytes()
+              const payload: AptosPayload = {
+                kind: "entry-function",
+                rawTxHex: bytesToHex(rawBytes),
+              }
+              const tx: UnsignedTx = {
+                chain: chainConfig.chainId,
+                from: req.from,
+                payload,
+                estimatedFee: sponsored ? 0n : 2_000n,
+                metadata: {
+                  intent:
+                    req.label ??
+                    `Call ${req.function} on ${String(chainConfig.chainId)}`,
+                  createdAt: Date.now(),
+                },
+              }
+              return tx
+            },
+            catch: (cause) =>
+              new FeeEstimationError({
+                chain: String(chainConfig.chainId),
+                cause,
+              }),
+          }),
+
+    simulateCall: (req) =>
+      req.kind !== "aptos"
+        ? Effect.fail(
+            new UnsupportedChainError({
+              chain: `Aptos adapter received non-Aptos CallRequest kind=${req.kind}`,
+            }),
+          )
+        : Effect.tryPromise({
+            try: async () => {
+              const senderAddr = AccountAddress.fromString(req.from)
+              const simple = await aptosClient.transaction.build.simple({
+                sender: senderAddr,
+                withFeePayer: sponsored,
+                data: {
+                  function: req.function,
+                  typeArguments: req.typeArguments
+                    ? [...req.typeArguments]
+                    : undefined,
+                  // The SDK's union is internal; the caller chose the
+                  // types they're passing. Cast through unknown so we
+                  // don't have to mirror the SDK's full type set here.
+                  functionArguments: [
+                    ...req.functionArguments,
+                  ] as unknown as Parameters<
+                    typeof aptosClient.transaction.build.simple
+                  >[0]["data"] extends { functionArguments: infer A }
+                    ? A
+                    : never,
+                },
+              })
+              // `simulate.simple` accepts the transaction; when no
+              // signerPublicKey is provided, the SDK fills in a
+              // zero-pubkey dummy — exactly what we want for a pre-
+              // signing dry-run.
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const simulate: any = (aptosClient as any).transaction?.simulate
+                ?.simple
+              if (typeof simulate !== "function") {
+                throw new Error(
+                  "aptosClient.transaction.simulate.simple is not available",
+                )
+              }
+              const responses = await simulate({ transaction: simple })
+              const res = Array.isArray(responses) ? responses[0] : responses
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              const r = res as any
+              const success = !!r && r.success === true
+              const gasUsed =
+                r && typeof r.gas_used === "string"
+                  ? BigInt(r.gas_used)
+                  : undefined
+              return {
+                success,
+                gasUsed,
+                revertReason: success
+                  ? undefined
+                  : typeof r?.vm_status === "string"
+                    ? r.vm_status
+                    : "aptos simulation failed",
+                raw: r,
+              } satisfies CallSimulation
+            },
+            catch: (cause) =>
+              new FeeEstimationError({
+                chain: String(chainConfig.chainId),
+                cause,
+              }),
+          }),
 
     broadcast: (signed) =>
       Effect.tryPromise({
