@@ -15,7 +15,7 @@ import {
 } from "@aptos-labs/ts-sdk"
 import { ed25519 } from "@noble/curves/ed25519"
 import { bytesToHex, hexToBytes } from "@noble/hashes/utils"
-import { sha3_256 } from "@noble/hashes/sha3"
+import { keccak_256, sha3_256 } from "@noble/hashes/sha3"
 import type { AssetId } from "../../model/asset.js"
 import type { TokenBalance } from "../../model/balance.js"
 import type { CallRequest, CallSimulation } from "../../model/call.js"
@@ -51,6 +51,10 @@ import type { ChainAdapter } from "./index.js"
 // Known Aptos USDC metadata (mainnet). Tests / devnet can override via config.
 const DEFAULT_APTOS_USDC_METADATA =
   "0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b"
+
+// Circle's CCTP package address is deployment-specific on Aptos, so we
+// match the MessageSent event by its unqualified suffix.
+const CIRCLE_MESSAGE_SENT_EVENT_SUFFIX = "::message_transmitter::MessageSent"
 
 /**
  * Normalise an arbitrary destination-chain recipient into the
@@ -523,12 +527,16 @@ export const makeAptosChainAdapter = (
           // Wait for inclusion; SDK helper polls until committed.
           // Keep this inside the try block so gas-station policy
           // rejections surface through BroadcastError.cause.
-          await aptosClient.waitForTransaction({ transactionHash: hash })
+          const committed = await aptosClient.waitForTransaction({
+            transactionHash: hash,
+          })
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const events = (committed as any)?.events ?? []
           return {
             chain: chainConfig.chainId,
             hash,
             status: "confirmed",
-            raw: pending,
+            raw: { pending, committed, events },
           } satisfies TxReceipt
         },
         catch: (cause) =>
@@ -643,8 +651,8 @@ export const makeAptosChainAdapter = (
 
     extractBurnMessage: (receipt) =>
       Effect.gen(function* () {
-        // Aptos CCTP support is forthcoming. Like the Solana adapter,
-        // we accept a pre-parsed cctpBurn record on receipt.raw.
+        // `cctpBurn` takes precedence so callers that pre-parse the
+        // burn (tests, custom receipt pipelines) aren't second-guessed.
         const raw = receipt.raw as
           | {
               cctpBurn?: {
@@ -654,28 +662,76 @@ export const makeAptosChainAdapter = (
                 messageHex: string
                 messageHash: string
               }
+              events?: ReadonlyArray<{
+                readonly type?: string
+                readonly data?: unknown
+              }>
             }
           | null
-        if (!raw || !raw.cctpBurn) {
+
+        if (raw?.cctpBurn) {
+          const b = raw.cctpBurn
+          return {
+            sourceDomain: b.sourceDomain,
+            destDomain: b.destDomain,
+            nonce: BigInt(b.nonce),
+            burnTxHash: receipt.hash,
+            messageBytes: hexToBytes(b.messageHex),
+            messageHash: b.messageHash,
+          } satisfies BurnMessage
+        }
+
+        const events = raw?.events ?? []
+        // The payload-shape check guards against unrelated MessageSent
+        // events other packages might emit.
+        const messageSent = events.find((ev) => {
+          if (typeof ev.type !== "string") return false
+          if (!ev.type.endsWith(CIRCLE_MESSAGE_SENT_EVENT_SUFFIX)) return false
+          const data = ev.data as { message?: unknown } | null
+          return typeof data?.message === "string"
+        })
+        if (!messageSent) {
           return yield* Effect.fail(
             new BroadcastError({
               chain: String(chainConfig.chainId),
               hash: receipt.hash,
               cause:
-                "Aptos receipt has no cctpBurn metadata; supply one via raw.cctpBurn",
+                "Aptos receipt has no MessageSent event and no raw.cctpBurn override",
             }),
           )
         }
-        const b = raw.cctpBurn
-        const burn: BurnMessage = {
-          sourceDomain: b.sourceDomain,
-          destDomain: b.destDomain,
-          nonce: BigInt(b.nonce),
-          burnTxHash: receipt.hash,
-          messageBytes: hexToBytes(b.messageHex),
-          messageHash: b.messageHash,
+
+        const msgHex = (
+          (messageSent.data as { message: string }).message
+        ).replace(/^0x/i, "")
+        if (msgHex.length < 2 * 24) {
+          return yield* Effect.fail(
+            new BroadcastError({
+              chain: String(chainConfig.chainId),
+              hash: receipt.hash,
+              cause: `MessageSent payload too short (${msgHex.length / 2} bytes)`,
+            }),
+          )
         }
-        return burn
+        const messageBytes = hexToBytes(msgHex)
+        // CCTP V1 header: version(4) | sourceDomain(4) | destDomain(4) | nonce(8) | ...
+        const view = new DataView(
+          messageBytes.buffer,
+          messageBytes.byteOffset,
+          messageBytes.byteLength,
+        )
+        const sourceDomain = view.getUint32(4, false)
+        const destDomain = view.getUint32(8, false)
+        const nonce = view.getBigUint64(12, false)
+        const messageHash = bytesToHex(keccak_256(messageBytes))
+        return {
+          sourceDomain,
+          destDomain,
+          nonce,
+          burnTxHash: receipt.hash,
+          messageBytes,
+          messageHash,
+        } satisfies BurnMessage
       }),
 
     buildMintTx: ({ recipient, messageBytes, attestation }) =>

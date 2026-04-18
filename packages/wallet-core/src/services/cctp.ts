@@ -3,7 +3,8 @@ import { bytesToHex, hexToBytes } from "@noble/hashes/utils"
 import { ChainAdapterRegistry } from "../adapters/chain/index.js"
 import { FetchAdapter } from "../adapters/fetch/index.js"
 import { StorageAdapter } from "../adapters/storage/index.js"
-import { WalletConfigService } from "../config/index.js"
+import { WalletConfigService, type WalletConfig } from "../config/index.js"
+import { CCTP_VERSIONS } from "../config/defaults.js"
 import type { Attestation, BurnMessage, PendingCctpTransfer } from "../model/cctp.js"
 import type { ChainId } from "../model/chain.js"
 import type { TxReceipt, UnsignedTx } from "../model/transaction.js"
@@ -160,9 +161,14 @@ export const CctpServiceLive = Layer.succeed(CctpService, {
       const fetcher = yield* FetchAdapter
       const configService = yield* WalletConfigService
       const cctp = configService.config.cctp
+      const version = resolveSourceCctpVersion(
+        configService.config,
+        burn.sourceDomain,
+      )
       return yield* pollCircleAttestation(fetcher, cctp.attestationApiUrl, burn, {
         intervalMs: cctp.attestationPollIntervalMs,
         timeoutMs: cctp.attestationTimeoutMs,
+        version,
       })
     }),
 
@@ -282,6 +288,10 @@ export const CctpServiceLive = Layer.succeed(CctpService, {
           key,
           textEncoder.encode(JSON.stringify(serialisePending(awaiting))),
         )
+        const version = resolveSourceCctpVersion(
+          configService.config,
+          current.burn.sourceDomain,
+        )
         attestation = yield* pollCircleAttestation(
           fetcher,
           cctp.attestationApiUrl,
@@ -289,6 +299,7 @@ export const CctpServiceLive = Layer.succeed(CctpService, {
           {
             intervalMs: cctp.attestationPollIntervalMs,
             timeoutMs: cctp.attestationTimeoutMs,
+            version,
           },
         )
       }
@@ -429,19 +440,43 @@ const deserialisePending = (
     : {}),
 })
 
+// It is the source chain (not the destination) that decides whether
+// the burn message flows through Iris V1 or V2.
+const resolveSourceCctpVersion = (
+  config: WalletConfig,
+  sourceDomain: number,
+): "v1" | "v2" => {
+  const match = config.chains.find((c) => c.cctpDomain === sourceDomain)
+  if (match) {
+    const override = config.cctp.contractAddresses[match.chainId]?.version
+    if (override) return override
+    const known = CCTP_VERSIONS[match.chainId]
+    if (known) return known
+  }
+  return "v2"
+}
+
 /**
- * Retry `waitForAttestation` using a simple poll-loop that respects
- * the configured interval + timeout. Re-exported for tests that want
- * to poll manually.
+ * Poll Circle's Iris API until an attestation is available. Exported for
+ * tests that want to drive the loop directly. If `apiUrl` already ends
+ * with `/v1` or `/v2` that segment is preserved; otherwise `opts.version`
+ * selects the path.
  */
 export const pollCircleAttestation = (
   fetcher: Context.Tag.Service<FetchAdapter>,
   apiUrl: string,
   burn: BurnMessage,
-  opts: { intervalMs: number; timeoutMs: number },
+  opts: {
+    intervalMs: number
+    timeoutMs: number
+    version?: "v1" | "v2"
+  },
 ): Effect.Effect<Attestation, CctpAttestationTimeout> =>
   Effect.gen(function* () {
-    const url = `${apiUrl.replace(/\/$/, "")}/attestations/0x${burn.messageHash}`
+    const trimmed = apiUrl.replace(/\/$/, "")
+    const hasVersion = /\/v[12]$/.test(trimmed)
+    const base = hasVersion ? trimmed : `${trimmed}/${opts.version ?? "v2"}`
+    const url = `${base}/attestations/0x${burn.messageHash}`
     const start = Date.now()
     while (Date.now() - start < opts.timeoutMs) {
       const res = yield* fetcher.request({ url, method: "GET" }).pipe(

@@ -9,6 +9,7 @@ import { ChainAdapterRegistry } from "./index.js"
 import { makeEvmChainAdapter } from "./evm.js"
 import { makeSolanaChainAdapter } from "./solana.js"
 import { makeAptosChainAdapter } from "./aptos.js"
+import { APTOS_CCTP_V1_MAINNET } from "./aptos-cctp-scripts.js"
 import { makeMockChainAdapter } from "./mock.js"
 
 /**
@@ -183,23 +184,35 @@ export const makeAptosAwareRegistryLive = (
               break
             }
             const cctp = cctpContractMap[chain.chainId]
+            // When the caller ships no per-chain CCTP config at all,
+            // fall back to Circle's mainnet Move-script bundle so
+            // EVM/Solana → Aptos mints work out of the box. Callers on
+            // testnet MUST supply `APTOS_CCTP_V1_TESTNET` explicitly —
+            // the scripts embed different Circle package addresses per
+            // network, and we can't infer testnet from `chain.chainId`
+            // alone. Once any `cctp` entry exists we respect exactly
+            // what the caller passed: mixing bundled mainnet bytecode
+            // with a testnet USDC override would fail on-chain.
+            const cctpContracts = cctp
+              ? {
+                  usdcTokenAddress: cctp.usdcToken,
+                  depositForBurnScript:
+                    cctp.aptosScriptBytecode?.depositForBurn,
+                  depositForBurnWithCallerScript:
+                    cctp.aptosScriptBytecode?.depositForBurnWithCaller,
+                  handleReceiveMessageScript:
+                    cctp.aptosScriptBytecode?.handleReceiveMessage,
+                }
+              : chain.chainId === "aptos"
+                ? APTOS_CCTP_V1_MAINNET
+                : undefined
             adapters.set(
               chain.chainId,
               makeAptosChainAdapter({
                 chainConfig: chain,
                 aptosClient: client,
                 sponsored: sponsoredChains?.has(chain.chainId) ?? false,
-                cctpContracts: cctp
-                  ? {
-                      usdcTokenAddress: cctp.usdcToken,
-                      depositForBurnScript:
-                        cctp.aptosScriptBytecode?.depositForBurn,
-                      depositForBurnWithCallerScript:
-                        cctp.aptosScriptBytecode?.depositForBurnWithCaller,
-                      handleReceiveMessageScript:
-                        cctp.aptosScriptBytecode?.handleReceiveMessage,
-                    }
-                  : undefined,
+                cctpContracts,
               }),
             )
             break

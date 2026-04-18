@@ -197,6 +197,30 @@ await wallet.transfer({
 // burn -> poll attestation -> mint, all automatic
 ```
 
+**Aptos as destination (CCTP V1)** — Aptos runs CCTP V1 only; burns must be
+V1 on the source chain. The library bundles Circle's compiled Move scripts
+(`handle_receive_message.mv` etc.) so no extra setup is needed for mainnet:
+
+```typescript
+import {
+  makeAptosAwareRegistryLive,
+  APTOS_CCTP_V1_MAINNET,  // auto-wired when no cctp entry exists for aptos
+  APTOS_CCTP_V1_TESTNET,  // pass explicitly for testnet deployments
+} from "cow-wallet"
+
+// On the source EVM chain, pin V1 in contractAddresses:
+cctp: {
+  contractAddresses: {
+    "evm:1": { tokenMessenger: "...", messageTransmitter: "...", usdcToken: "...", version: "v1" },
+  },
+}
+```
+
+`pollCircleAttestation` now auto-selects `/v1/attestations/{hash}` vs
+`/v2/attestations/{hash}` based on the **source** chain's CCTP version —
+the default `attestationApiUrl` is the Iris root
+(`https://iris-api.circle.com`), not a pre-versioned path.
+
 ### Arbitrary contract / program / entry-function calls
 
 Use `sendCall` / `buildCall` / `simulateCall` for anything beyond native / USDC transfers. They reuse the same key-isolated signing, auth gate, session, elevated-fee, and broadcast pipeline — so every guarantee from `transfer()` applies.
