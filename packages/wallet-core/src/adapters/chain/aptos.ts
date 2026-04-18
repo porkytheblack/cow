@@ -6,8 +6,11 @@ import {
   Deserializer,
   Ed25519PublicKey,
   Ed25519Signature,
+  MoveVector,
   RawTransaction,
   SimpleTransaction,
+  U32,
+  U64,
   generateSigningMessageForTransaction,
 } from "@aptos-labs/ts-sdk"
 import { ed25519 } from "@noble/curves/ed25519"
@@ -49,6 +52,27 @@ import type { ChainAdapter } from "./index.js"
 const DEFAULT_APTOS_USDC_METADATA =
   "0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b"
 
+/**
+ * Normalise an arbitrary destination-chain recipient into the
+ * 0x-prefixed 32-byte address that Circle's Aptos CCTP scripts expect
+ * for the `mint_recipient` arg. 20-byte EVM addresses are left-padded
+ * with zeros; already-32-byte Aptos / Solana addresses pass through.
+ */
+const normaliseCctpRecipient = (recipient: string): string => {
+  const clean = recipient.startsWith("0x") ? recipient.slice(2) : recipient
+  if (!/^[0-9a-fA-F]*$/.test(clean)) {
+    throw new Error(
+      `CCTP mintRecipient must be a hex string (got non-hex: ${recipient})`,
+    )
+  }
+  if (clean.length > 64) {
+    throw new Error(
+      `CCTP mintRecipient must be <= 32 bytes (got ${clean.length / 2})`,
+    )
+  }
+  return `0x${clean.padStart(64, "0")}`
+}
+
 interface AptosPayload {
   readonly kind:
     | "direct-transfer"
@@ -75,11 +99,37 @@ const rehydrateSimpleTransaction = (rawTxHex: string): SimpleTransaction => {
 
 // --- Factory ------------------------------------------------------------
 
+/**
+ * Circle's Aptos CCTP V1 burn/mint functions are `public fun`s that
+ * take/return non-copyable `FungibleAsset` / `Receipt` types, so they
+ * cannot be called as a plain entry function. Circle ships compiled
+ * Move **scripts** that compose the primitives end-to-end; the wallet
+ * submits them as `TransactionPayloadScript` payloads with typed args.
+ *
+ * Consumers load the bytecode from circlefin/aptos-cctp's
+ * `packages/token_messenger_minter/scripts/` folder
+ * (`deposit_for_burn.mv`, optionally `deposit_for_burn_with_caller.mv`,
+ * and `handle_receive_message.mv`) and pass them here.
+ */
+export interface AptosCctpV1Contracts {
+  readonly usdcTokenAddress?: string
+  readonly depositForBurnScript?: Uint8Array
+  readonly depositForBurnWithCallerScript?: Uint8Array
+  readonly handleReceiveMessageScript?: Uint8Array
+  readonly version?: "v1"
+}
+
 export interface AptosAdapterOptions {
   readonly chainConfig: ChainConfig
   readonly aptosClient: Aptos
   /** Override the USDC fungible asset metadata address. */
   readonly usdcMetadataAddress?: string
+  /**
+   * CCTP V1 support. Without this, `buildCctpBurnTx` and `buildMintTx`
+   * return `UnsupportedRouteError` — there is no safe default because
+   * Circle's Move script bytecode is not bundled with cow-wallet.
+   */
+  readonly cctpContracts?: AptosCctpV1Contracts
   /**
    * When true, every tx this adapter builds is treated as sponsored:
    *
@@ -107,6 +157,8 @@ export const makeAptosChainAdapter = (
   const { chainConfig, aptosClient, usdcMetadataAddress } = opts
   const sponsored = opts.sponsored ?? false
   const usdcAddress = usdcMetadataAddress ?? DEFAULT_APTOS_USDC_METADATA
+  const cctp = opts.cctpContracts
+  const cctpUsdcAddress = cctp?.usdcTokenAddress ?? usdcAddress
 
   const buildTransactionForIntent = async (params: {
     from: string
@@ -487,14 +539,64 @@ export const makeAptosChainAdapter = (
           }),
       }),
 
-    buildCctpBurnTx: (_params) =>
-      Effect.fail(
-        new UnsupportedRouteError({
-          from: String(chainConfig.chainId),
-          to: "cctp",
-          asset: "USDC",
-        }),
-      ),
+    buildCctpBurnTx: ({ from, destinationDomain, recipient, amount }) =>
+      Effect.gen(function* () {
+        if (!cctp?.depositForBurnScript) {
+          return yield* Effect.fail(
+            new UnsupportedRouteError({
+              from: String(chainConfig.chainId),
+              to: `cctp:${destinationDomain}`,
+              asset: "USDC",
+            }),
+          )
+        }
+        // Mint recipient on Aptos CCTP scripts is always an `address`
+        // (a 32-byte hex string with `0x` prefix). For EVM destinations
+        // the 20-byte address is left-padded to 32 bytes.
+        const mintRecipient = normaliseCctpRecipient(recipient)
+
+        return yield* Effect.tryPromise({
+          try: async () => {
+            const senderAddr = AccountAddress.fromString(from)
+            const txn = await aptosClient.transaction.build.simple({
+              sender: senderAddr,
+              withFeePayer: sponsored,
+              data: {
+                bytecode: cctp.depositForBurnScript!,
+                functionArguments: [
+                  new U64(amount),
+                  new U32(destinationDomain),
+                  AccountAddress.fromString(mintRecipient),
+                  AccountAddress.fromString(cctpUsdcAddress),
+                ],
+              },
+            })
+            const rawBytes = txn.rawTransaction.bcsToBytes()
+            const payload: AptosPayload = {
+              kind: "cctp-burn",
+              rawTxHex: bytesToHex(rawBytes),
+              recipient,
+              amount: amount.toString(),
+            }
+            const tx: UnsignedTx = {
+              chain: chainConfig.chainId,
+              from,
+              payload,
+              estimatedFee: sponsored ? 0n : 2_000n,
+              metadata: {
+                intent: `CCTP V1 burn ${amount} USDC (domain ${destinationDomain})`,
+                createdAt: Date.now(),
+              },
+            }
+            return tx
+          },
+          catch: (cause) =>
+            new FeeEstimationError({
+              chain: String(chainConfig.chainId),
+              cause,
+            }),
+        })
+      }),
 
     getBalance: (address, asset) =>
       Effect.tryPromise({
@@ -577,46 +679,57 @@ export const makeAptosChainAdapter = (
       }),
 
     buildMintTx: ({ recipient, messageBytes, attestation }) =>
-      Effect.tryPromise({
-        try: async () => {
-          // Placeholder entry function call. Real Aptos CCTP wiring will
-          // call the Circle-published module address with the message
-          // bytes + attestation as arguments.
-          const senderAddr = AccountAddress.fromString(recipient)
-          const txn = await aptosClient.transaction.build.simple({
-            sender: senderAddr,
-            withFeePayer: sponsored,
-            data: {
-              function: "0x0::cctp_message_transmitter::receive_message",
-              functionArguments: [
-                Array.from(messageBytes),
-                Array.from(hexToBytes(attestation.replace(/^0x/, ""))),
-              ],
-            },
-          })
-          const rawBytes = txn.rawTransaction.bcsToBytes()
-          const payload: AptosPayload = {
-            kind: "cctp-mint",
-            rawTxHex: bytesToHex(rawBytes),
-            recipient,
-          }
-          const tx: UnsignedTx = {
-            chain: chainConfig.chainId,
-            from: recipient,
-            payload,
-            estimatedFee: sponsored ? 0n : 2_000n,
-            metadata: {
-              intent: "CCTP mint on Aptos",
-              createdAt: Date.now(),
-            },
-          }
-          return tx
-        },
-        catch: (cause) =>
-          new FeeEstimationError({
-            chain: String(chainConfig.chainId),
-            cause,
-          }),
+      Effect.gen(function* () {
+        if (!cctp?.handleReceiveMessageScript) {
+          return yield* Effect.fail(
+            new FeeEstimationError({
+              chain: String(chainConfig.chainId),
+              cause:
+                "Aptos CCTP mint requires `cctpContracts.handleReceiveMessageScript` — load the compiled Move script bytecode from circlefin/aptos-cctp",
+            }),
+          )
+        }
+        const attestationHex = attestation.startsWith("0x")
+          ? attestation.slice(2)
+          : attestation
+        return yield* Effect.tryPromise({
+          try: async () => {
+            const senderAddr = AccountAddress.fromString(recipient)
+            const txn = await aptosClient.transaction.build.simple({
+              sender: senderAddr,
+              withFeePayer: sponsored,
+              data: {
+                bytecode: cctp.handleReceiveMessageScript!,
+                functionArguments: [
+                  MoveVector.U8(messageBytes),
+                  MoveVector.U8(hexToBytes(attestationHex)),
+                ],
+              },
+            })
+            const rawBytes = txn.rawTransaction.bcsToBytes()
+            const payload: AptosPayload = {
+              kind: "cctp-mint",
+              rawTxHex: bytesToHex(rawBytes),
+              recipient,
+            }
+            const tx: UnsignedTx = {
+              chain: chainConfig.chainId,
+              from: recipient,
+              payload,
+              estimatedFee: sponsored ? 0n : 2_000n,
+              metadata: {
+                intent: "CCTP V1 mint on Aptos",
+                createdAt: Date.now(),
+              },
+            }
+            return tx
+          },
+          catch: (cause) =>
+            new FeeEstimationError({
+              chain: String(chainConfig.chainId),
+              cause,
+            }),
+        })
       }),
   }
 
