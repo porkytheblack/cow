@@ -1,11 +1,15 @@
 import { Effect } from "effect"
 import {
+  ComputeBudgetProgram,
+  Keypair,
   PublicKey,
   SystemProgram,
   Transaction,
   TransactionInstruction,
 } from "@solana/web3.js"
 import { ed25519 } from "@noble/curves/ed25519"
+import { sha256 } from "@noble/hashes/sha256"
+import { bytesToHex, hexToBytes, randomBytes } from "@noble/hashes/utils"
 import { base58Encode, base58Decode } from "../../services/keyring-crypto.js"
 import type { AssetId } from "../../model/asset.js"
 import type { TokenBalance } from "../../model/balance.js"
@@ -54,6 +58,98 @@ const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey(
 
 // SPL Token `Transfer` instruction discriminator.
 const SPL_TRANSFER_DISCRIMINATOR = 3
+
+/**
+ * Circle's canonical CCTP V1 program IDs on Solana mainnet + devnet.
+ *
+ * Pulled from https://github.com/circlefin/solana-cctp-contracts
+ * (`declare_id!` in `programs/{message-transmitter,token-messenger-minter}/src/lib.rs`)
+ * and confirmed via Solana Explorer. Consumers should still pin these in
+ * their own config — Circle has re-deployed CCTP programs in the past.
+ */
+export const DEFAULT_SOLANA_CCTP_V1 = {
+  tokenMessengerMinterProgramId: "CCTPiPYPc6AsJuwueEnWgSgucamXDZwBd53dQ11YiKX3",
+  messageTransmitterProgramId: "CCTPmbSD7gX1bxKPAmg77w8oFzNFpaQiQUWD43TKaecd",
+  usdcMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+} as const
+
+// CCTP V1 burn message is 248 bytes: 116-byte header + 132-byte BurnMessage body.
+//   header: version(4) | sourceDomain(4) | destDomain(4) | nonce(8) | sender(32) | recipient(32) | destCaller(32)
+//   body:   version(4) | burnToken(32) | mintRecipient(32) | amount(32) | messageSender(32)
+// All integer fields are big-endian.
+const CCTP_MESSAGE_HEADER_LEN = 116
+const CCTP_BURN_MESSAGE_BODY_LEN = 132
+const CCTP_V1_MESSAGE_LEN = CCTP_MESSAGE_HEADER_LEN + CCTP_BURN_MESSAGE_BODY_LEN
+
+// --- Anchor / Borsh helpers --------------------------------------------
+
+const textBytes = (s: string): Uint8Array => new TextEncoder().encode(s)
+
+/**
+ * Anchor instruction discriminator: first 8 bytes of
+ * `sha256("<namespace>:<name>")`. The `global` namespace is used for
+ * user-callable instructions; `event` for `emit_cpi!` events.
+ */
+const anchorDiscriminator = (
+  namespace: "global" | "event",
+  name: string,
+): Uint8Array => sha256(textBytes(`${namespace}:${name}`)).slice(0, 8)
+
+const u32ToLeBytes = (value: number): Uint8Array => {
+  const buf = new Uint8Array(4)
+  buf[0] = value & 0xff
+  buf[1] = (value >>> 8) & 0xff
+  buf[2] = (value >>> 16) & 0xff
+  buf[3] = (value >>> 24) & 0xff
+  return buf
+}
+
+const u32BeFromBytes = (bytes: Uint8Array, offset: number): number =>
+  ((bytes[offset]! << 24) |
+    (bytes[offset + 1]! << 16) |
+    (bytes[offset + 2]! << 8) |
+    bytes[offset + 3]!) >>>
+  0
+
+const u64BeFromBytes = (bytes: Uint8Array, offset: number): bigint => {
+  let v = 0n
+  for (let i = 0; i < 8; i++) v = (v << 8n) | BigInt(bytes[offset + i]!)
+  return v
+}
+
+/**
+ * Decode a 32-byte CCTP `mintRecipient` from an arbitrary destination
+ * chain's recipient representation. EVM 20-byte addresses are
+ * left-padded with zeros; Aptos / Solana already supply 32 bytes.
+ */
+const cctpMintRecipientBytes = (recipient: string): Uint8Array => {
+  // Hex form (0x-prefixed or bare).
+  if (/^0x[0-9a-fA-F]+$/.test(recipient) || /^[0-9a-fA-F]+$/.test(recipient)) {
+    const clean = recipient.startsWith("0x") ? recipient.slice(2) : recipient
+    const bytes = hexToBytes(clean.length % 2 === 0 ? clean : `0${clean}`)
+    if (bytes.length > 32) {
+      throw new Error(
+        `CCTP mintRecipient exceeds 32 bytes (got ${bytes.length})`,
+      )
+    }
+    const padded = new Uint8Array(32)
+    padded.set(bytes, 32 - bytes.length)
+    return padded
+  }
+  // Base58 Solana pubkey path.
+  return new PublicKey(recipient).toBytes()
+}
+
+const findPda = (
+  seeds: ReadonlyArray<Uint8Array>,
+  programId: PublicKey,
+): PublicKey => {
+  const [pda] = PublicKey.findProgramAddressSync(
+    seeds.map((s) => s),
+    programId,
+  )
+  return pda
+}
 
 // --- Helpers ------------------------------------------------------------
 
@@ -139,6 +235,19 @@ interface SolanaPayload {
   readonly destChain?: string
   readonly amount?: string
   readonly recipient?: string
+  /**
+   * CCTP `depositForBurn` requires a fresh `message_sent_event_data`
+   * account to be created inside the instruction — it must be a signer.
+   * The adapter generates that keypair at build time and stashes its
+   * 32-byte ed25519 seed here (base58). `attachSignature` co-signs the
+   * serialized message with this seed so the tx ships with the correct
+   * two-signer authenticator set.
+   *
+   * This secret is ephemeral: it's only valid for the containing tx and
+   * is discarded once the tx is broadcast. It is NOT derived from the
+   * user's mnemonic.
+   */
+  readonly ephemeralSignerSecretBase58?: string
 }
 
 const rehydrateTransaction = (payload: SolanaPayload): Transaction => {
@@ -192,11 +301,259 @@ const base64Decode = (b64: string): Uint8Array => {
   return bytes
 }
 
+// --- CCTP V1 instruction builders --------------------------------------
+
+export interface SolanaCctpV1Contracts {
+  readonly tokenMessengerMinterProgramId: string
+  readonly messageTransmitterProgramId: string
+  readonly usdcMint: string
+  readonly version?: "v1"
+}
+
+interface BuildCctpBurnIxContext {
+  readonly owner: PublicKey
+  readonly tokenMessengerMinterProgramId: PublicKey
+  readonly messageTransmitterProgramId: PublicKey
+  readonly usdcMint: PublicKey
+  readonly messageSentEventData: PublicKey
+  readonly amount: bigint
+  readonly destinationDomain: number
+  readonly mintRecipient: Uint8Array // 32 bytes
+}
+
+/**
+ * Build the `TokenMessengerMinter.deposit_for_burn` instruction + a
+ * leading `ComputeBudget.setComputeUnitLimit(300_000)` so CCTP burns
+ * reliably fit inside the default 200k CU envelope used by SimpleTransaction.
+ *
+ * Account order + PDA seeds match `programs/token-messenger-minter/src/
+ * token_messenger/instructions/deposit_for_burn.rs` in
+ * circlefin/solana-cctp-contracts.
+ */
+const buildSolanaCctpBurnInstructions = (
+  ctx: BuildCctpBurnIxContext,
+): readonly TransactionInstruction[] => {
+  const {
+    owner,
+    tokenMessengerMinterProgramId: tmm,
+    messageTransmitterProgramId: mt,
+    usdcMint,
+    messageSentEventData,
+  } = ctx
+
+  const senderAuthority = findPda([textBytes("sender_authority")], tmm)
+  const messageTransmitterState = findPda([textBytes("message_transmitter")], mt)
+  const tokenMessengerState = findPda([textBytes("token_messenger")], tmm)
+  const remoteTokenMessenger = findPda(
+    [textBytes("remote_token_messenger"), textBytes(String(ctx.destinationDomain))],
+    tmm,
+  )
+  const tokenMinter = findPda([textBytes("token_minter")], tmm)
+  const localToken = findPda([textBytes("local_token"), usdcMint.toBuffer()], tmm)
+  const eventAuthority = findPda([textBytes("__event_authority")], tmm)
+  const burnTokenAccount = deriveAta(owner, usdcMint)
+
+  // Anchor ix data: discriminator(8) | amount u64 LE(8) | destDomain u32 LE(4) | mintRecipient [u8;32](32)
+  const disc = anchorDiscriminator("global", "deposit_for_burn")
+  const data = new Uint8Array(8 + 8 + 4 + 32)
+  data.set(disc, 0)
+  data.set(u64ToLeBytes(ctx.amount), 8)
+  data.set(u32ToLeBytes(ctx.destinationDomain), 16)
+  data.set(ctx.mintRecipient, 20)
+
+  const computeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
+    units: 300_000,
+  })
+
+  const cctpIx = new TransactionInstruction({
+    programId: tmm,
+    keys: [
+      { pubkey: owner, isSigner: true, isWritable: true },
+      { pubkey: owner, isSigner: true, isWritable: true }, // event_rent_payer
+      { pubkey: senderAuthority, isSigner: false, isWritable: false },
+      { pubkey: burnTokenAccount, isSigner: false, isWritable: true },
+      { pubkey: messageTransmitterState, isSigner: false, isWritable: true },
+      { pubkey: tokenMessengerState, isSigner: false, isWritable: false },
+      { pubkey: remoteTokenMessenger, isSigner: false, isWritable: false },
+      { pubkey: tokenMinter, isSigner: false, isWritable: false },
+      { pubkey: localToken, isSigner: false, isWritable: true },
+      { pubkey: usdcMint, isSigner: false, isWritable: true },
+      { pubkey: messageSentEventData, isSigner: true, isWritable: true },
+      { pubkey: mt, isSigner: false, isWritable: false },
+      { pubkey: tmm, isSigner: false, isWritable: false },
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: eventAuthority, isSigner: false, isWritable: false },
+      { pubkey: tmm, isSigner: false, isWritable: false }, // `program` trailing account
+    ],
+    data: asBuffer(data),
+  })
+
+  return [computeBudgetIx, cctpIx]
+}
+
+/**
+ * Parse a CCTP V1 message header + BurnMessage body out of the raw
+ * `messageBytes` so `buildMintTx` can derive the PDAs it needs.
+ */
+const parseCctpV1Message = (bytes: Uint8Array) => {
+  if (bytes.length < CCTP_V1_MESSAGE_LEN) {
+    throw new Error(
+      `CCTP message too short: expected >= ${CCTP_V1_MESSAGE_LEN} bytes, got ${bytes.length}`,
+    )
+  }
+  const sourceDomain = u32BeFromBytes(bytes, 4)
+  const destinationDomain = u32BeFromBytes(bytes, 8)
+  const nonce = u64BeFromBytes(bytes, 12)
+  // body begins at offset 116
+  // body layout: version(4) | burnToken(32) | mintRecipient(32) | amount(32) | messageSender(32)
+  const bodyOffset = CCTP_MESSAGE_HEADER_LEN
+  const burnToken = bytes.slice(bodyOffset + 4, bodyOffset + 4 + 32)
+  const mintRecipient = bytes.slice(bodyOffset + 36, bodyOffset + 36 + 32)
+  return {
+    sourceDomain,
+    destinationDomain,
+    nonce,
+    burnToken,
+    mintRecipient,
+  }
+}
+
+/**
+ * CCTP V1 buckets nonces into groups of 6400 for the `used_nonces`
+ * account seed. Bucket_start = ((nonce - 1) / 6400) * 6400 + 1.
+ * Source: `programs/message-transmitter/src/state.rs::UsedNonces`.
+ */
+const MAX_NONCES_PER_ACCOUNT = 6400n
+const cctpNonceBucketStart = (nonce: bigint): bigint =>
+  ((nonce - 1n) / MAX_NONCES_PER_ACCOUNT) * MAX_NONCES_PER_ACCOUNT + 1n
+
+interface BuildCctpMintIxContext {
+  readonly payer: PublicKey
+  readonly tokenMessengerMinterProgramId: PublicKey
+  readonly messageTransmitterProgramId: PublicKey
+  readonly usdcMint: PublicKey
+  readonly recipientTokenAccount: PublicKey
+  readonly sourceDomain: number
+  readonly firstNonceInBucket: bigint
+  readonly sourceToken: Uint8Array // 32-byte remote USDC address
+  readonly messageBytes: Uint8Array
+  readonly attestation: Uint8Array
+}
+
+/**
+ * Build the `MessageTransmitter.receive_message` instruction.
+ *
+ * Account order matches
+ * `programs/message-transmitter/src/instructions/receive_message.rs`,
+ * followed by the `handle_receive_message` remaining accounts that the
+ * MessageTransmitter forwards to TokenMessengerMinter as a CPI.
+ */
+const buildSolanaCctpMintInstructions = (
+  ctx: BuildCctpMintIxContext,
+): readonly TransactionInstruction[] => {
+  const {
+    payer,
+    tokenMessengerMinterProgramId: tmm,
+    messageTransmitterProgramId: mt,
+    usdcMint,
+    recipientTokenAccount,
+  } = ctx
+
+  // MessageTransmitter PDAs.
+  const authorityPda = findPda(
+    [textBytes("message_transmitter_authority"), tmm.toBuffer()],
+    mt,
+  )
+  const messageTransmitterState = findPda([textBytes("message_transmitter")], mt)
+  const usedNonces = findPda(
+    [
+      textBytes("used_nonces"),
+      textBytes(String(ctx.sourceDomain)),
+      textBytes(ctx.firstNonceInBucket.toString()),
+    ],
+    mt,
+  )
+
+  // TokenMessengerMinter remaining accounts (CPI target).
+  const tokenMessengerState = findPda([textBytes("token_messenger")], tmm)
+  const remoteTokenMessenger = findPda(
+    [textBytes("remote_token_messenger"), textBytes(String(ctx.sourceDomain))],
+    tmm,
+  )
+  const tokenMinter = findPda([textBytes("token_minter")], tmm)
+  const localToken = findPda([textBytes("local_token"), usdcMint.toBuffer()], tmm)
+  const tokenPair = findPda(
+    [
+      textBytes("token_pair"),
+      textBytes(String(ctx.sourceDomain)),
+      ctx.sourceToken,
+    ],
+    tmm,
+  )
+  const custodyTokenAccount = findPda(
+    [textBytes("custody"), usdcMint.toBuffer()],
+    tmm,
+  )
+  const eventAuthority = findPda([textBytes("__event_authority")], tmm)
+
+  // Anchor ix data: disc(8) | message: Vec<u8> (u32 LE len + bytes) | attestation: Vec<u8>
+  const disc = anchorDiscriminator("global", "receive_message")
+  const msgLen = ctx.messageBytes.length
+  const attLen = ctx.attestation.length
+  const data = new Uint8Array(8 + 4 + msgLen + 4 + attLen)
+  data.set(disc, 0)
+  data.set(u32ToLeBytes(msgLen), 8)
+  data.set(ctx.messageBytes, 12)
+  data.set(u32ToLeBytes(attLen), 12 + msgLen)
+  data.set(ctx.attestation, 12 + msgLen + 4)
+
+  const computeBudgetIx = ComputeBudgetProgram.setComputeUnitLimit({
+    units: 400_000,
+  })
+
+  const receiveIx = new TransactionInstruction({
+    programId: mt,
+    keys: [
+      { pubkey: payer, isSigner: true, isWritable: true },
+      { pubkey: payer, isSigner: true, isWritable: false }, // caller (same as payer for self-mint)
+      { pubkey: authorityPda, isSigner: false, isWritable: false },
+      { pubkey: messageTransmitterState, isSigner: false, isWritable: true },
+      { pubkey: usedNonces, isSigner: false, isWritable: true },
+      { pubkey: tmm, isSigner: false, isWritable: false }, // receiver = TokenMessengerMinter program
+      { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
+      // remaining_accounts forwarded to handle_receive_message CPI:
+      { pubkey: tokenMessengerState, isSigner: false, isWritable: false },
+      { pubkey: remoteTokenMessenger, isSigner: false, isWritable: false },
+      { pubkey: tokenMinter, isSigner: false, isWritable: true },
+      { pubkey: localToken, isSigner: false, isWritable: true },
+      { pubkey: tokenPair, isSigner: false, isWritable: false },
+      { pubkey: recipientTokenAccount, isSigner: false, isWritable: true },
+      { pubkey: custodyTokenAccount, isSigner: false, isWritable: true },
+      { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+      { pubkey: usdcMint, isSigner: false, isWritable: true },
+      { pubkey: eventAuthority, isSigner: false, isWritable: false },
+      { pubkey: tmm, isSigner: false, isWritable: false }, // program trailing
+    ],
+    data: asBuffer(data),
+  })
+
+  return [computeBudgetIx, receiveIx]
+}
+
 // --- Factory ------------------------------------------------------------
 
 export interface SolanaAdapterOptions {
   readonly chainConfig: ChainConfig
   readonly fetcher: FetchAdapterShape
+  /**
+   * CCTP V1 configuration for this Solana chain. When omitted,
+   * `buildCctpBurnTx` / `buildMintTx` fall back to
+   * `DEFAULT_SOLANA_CCTP_V1` — Circle's mainnet program IDs. Pass
+   * `cctpContracts: null` (or configure the chain without CCTP) to
+   * disable CCTP entirely and surface `UnsupportedRouteError`.
+   */
+  readonly cctpContracts?: SolanaCctpV1Contracts
 }
 
 export const makeSolanaChainAdapter = (
@@ -204,6 +561,13 @@ export const makeSolanaChainAdapter = (
 ): ChainAdapter => {
   const { chainConfig, fetcher } = opts
   const rpcUrl = chainConfig.rpcUrl
+  const cctp: SolanaCctpV1Contracts =
+    opts.cctpContracts ?? DEFAULT_SOLANA_CCTP_V1
+  const cctpProgramIds = {
+    tmm: new PublicKey(cctp.tokenMessengerMinterProgramId),
+    mt: new PublicKey(cctp.messageTransmitterProgramId),
+    usdc: new PublicKey(cctp.usdcMint),
+  }
 
   const rpc = <T>(method: string, params: unknown = []) =>
     jsonRpcCall<T>(fetcher, rpcUrl, method, params)
@@ -331,6 +695,19 @@ export const makeSolanaChainAdapter = (
           }
           const payload = tx.payload as SolanaPayload
           const solTx = rehydrateTransaction(payload)
+
+          // CCTP burns require a second signer — the `message_sent_event_data`
+          // account. We generated its keypair at build time and stashed the
+          // seed on the payload; sign the serialized message with it here so
+          // the tx carries both signatures.
+          if (payload.ephemeralSignerSecretBase58) {
+            const seed = base58Decode(payload.ephemeralSignerSecretBase58)
+            const eventKp = Keypair.fromSeed(seed)
+            const message = new Uint8Array(solTx.serializeMessage())
+            const eventSig = ed25519.sign(message, seed)
+            solTx.addSignature(eventKp.publicKey, asBuffer(eventSig))
+          }
+
           solTx.addSignature(new PublicKey(publicKey), asBuffer(signature))
           const raw = new Uint8Array(
             solTx.serialize({ verifySignatures: true }),
@@ -526,14 +903,71 @@ export const makeSolanaChainAdapter = (
         } satisfies CallSimulation
       }),
 
-    buildCctpBurnTx: (_params) =>
-      Effect.fail(
-        new UnsupportedRouteError({
-          from: String(chainConfig.chainId),
-          to: "cctp",
-          asset: "USDC",
-        }),
-      ),
+    buildCctpBurnTx: ({ from, destinationDomain, recipient, amount }) =>
+      Effect.gen(function* () {
+        const blockhashRes = yield* rpc<{
+          value: { blockhash: string; lastValidBlockHeight: number }
+        }>("getLatestBlockhash", [{ commitment: "finalized" }]).pipe(
+          Effect.catchAll((cause) =>
+            Effect.fail(
+              new FeeEstimationError({
+                chain: String(chainConfig.chainId),
+                cause,
+              }),
+            ),
+          ),
+        )
+
+        // Ephemeral keypair for `message_sent_event_data` — must sign the
+        // tx because the CCTP program creates the account with it as the
+        // rent-paying signer. `attachSignature` co-signs with its seed.
+        const eventSeed = randomBytes(32)
+        const eventKeypair = Keypair.fromSeed(eventSeed)
+
+        const mintRecipient = yield* Effect.try({
+          try: () => cctpMintRecipientBytes(recipient),
+          catch: (cause) =>
+            new FeeEstimationError({
+              chain: String(chainConfig.chainId),
+              cause,
+            }),
+        })
+
+        const ixs = buildSolanaCctpBurnInstructions({
+          owner: new PublicKey(from),
+          tokenMessengerMinterProgramId: cctpProgramIds.tmm,
+          messageTransmitterProgramId: cctpProgramIds.mt,
+          usdcMint: cctpProgramIds.usdc,
+          messageSentEventData: eventKeypair.publicKey,
+          amount,
+          destinationDomain,
+          mintRecipient,
+        })
+
+        const payload: SolanaPayload = {
+          kind: "cctp-burn",
+          blockhash: blockhashRes.value.blockhash,
+          lastValidBlockHeight: blockhashRes.value.lastValidBlockHeight,
+          instructions: ixs.map(encodeInstruction),
+          feePayer: from,
+          destChain: `cctp:${destinationDomain}`,
+          amount: amount.toString(),
+          recipient,
+          ephemeralSignerSecretBase58: base58Encode(eventSeed),
+        }
+
+        const tx: UnsignedTx = {
+          chain: chainConfig.chainId,
+          from,
+          payload,
+          estimatedFee: 5_000n,
+          metadata: {
+            intent: `CCTP V1 burn ${amount} USDC (domain ${destinationDomain})`,
+            createdAt: Date.now(),
+          },
+        }
+        return tx
+      }),
 
     broadcast: (signed) =>
       Effect.gen(function* () {
@@ -669,17 +1103,58 @@ export const makeSolanaChainAdapter = (
       }),
 
     buildMintTx: ({ recipient, messageBytes, attestation }) =>
-      Effect.sync(() => {
-        // Build a placeholder CCTP mint transaction. Consumer wiring the
-        // Solana CCTP program can replace this by passing a custom
-        // adapter factory that overrides buildMintTx.
+      Effect.gen(function* () {
+        // Parse the CCTP V1 message header + BurnMessage body to derive
+        // the `source_domain`, `nonce`, and `source_token` needed for
+        // the `receive_message` PDAs.
+        const parsed = yield* Effect.try({
+          try: () => parseCctpV1Message(messageBytes),
+          catch: (cause) =>
+            new FeeEstimationError({
+              chain: String(chainConfig.chainId),
+              cause,
+            }),
+        })
+
+        const blockhashRes = yield* rpc<{
+          value: { blockhash: string; lastValidBlockHeight: number }
+        }>("getLatestBlockhash", [{ commitment: "finalized" }]).pipe(
+          Effect.catchAll((cause) =>
+            Effect.fail(
+              new FeeEstimationError({
+                chain: String(chainConfig.chainId),
+                cause,
+              }),
+            ),
+          ),
+        )
+
+        const attestationBytes = attestation.startsWith("0x")
+          ? hexToBytes(attestation.slice(2))
+          : hexToBytes(attestation)
+
+        const payer = new PublicKey(recipient)
+        const recipientTokenAccount = deriveAta(payer, cctpProgramIds.usdc)
+
+        const ixs = buildSolanaCctpMintInstructions({
+          payer,
+          tokenMessengerMinterProgramId: cctpProgramIds.tmm,
+          messageTransmitterProgramId: cctpProgramIds.mt,
+          usdcMint: cctpProgramIds.usdc,
+          recipientTokenAccount,
+          sourceDomain: parsed.sourceDomain,
+          firstNonceInBucket: cctpNonceBucketStart(parsed.nonce),
+          sourceToken: parsed.burnToken,
+          messageBytes,
+          attestation: attestationBytes,
+        })
+
         const payload: SolanaPayload = {
           kind: "cctp-mint",
-          blockhash: "11111111111111111111111111111111",
-          lastValidBlockHeight: 0,
-          instructions: [],
+          blockhash: blockhashRes.value.blockhash,
+          lastValidBlockHeight: blockhashRes.value.lastValidBlockHeight,
+          instructions: ixs.map(encodeInstruction),
           feePayer: recipient,
-          amount: undefined,
           recipient,
         }
         const tx: UnsignedTx = {
@@ -688,7 +1163,7 @@ export const makeSolanaChainAdapter = (
           payload,
           estimatedFee: 5_000n,
           metadata: {
-            intent: `CCTP mint on Solana (${messageBytes.length}B msg, attestation ${attestation.length / 2}B)`,
+            intent: `CCTP V1 mint on Solana (source domain ${parsed.sourceDomain}, nonce ${parsed.nonce})`,
             createdAt: Date.now(),
           },
         }

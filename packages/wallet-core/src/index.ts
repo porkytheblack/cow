@@ -68,8 +68,17 @@ export {
   makeMockChainAdapterWithState,
 } from "./adapters/chain/mock.js"
 export { makeEvmChainAdapter, buildEvmCctpBurnTx } from "./adapters/chain/evm.js"
-export { makeSolanaChainAdapter } from "./adapters/chain/solana.js"
-export { makeAptosChainAdapter } from "./adapters/chain/aptos.js"
+export {
+  makeSolanaChainAdapter,
+  DEFAULT_SOLANA_CCTP_V1,
+  type SolanaAdapterOptions,
+  type SolanaCctpV1Contracts,
+} from "./adapters/chain/solana.js"
+export {
+  makeAptosChainAdapter,
+  type AptosAdapterOptions,
+  type AptosCctpV1Contracts,
+} from "./adapters/chain/aptos.js"
 export { jsonRpcCall } from "./adapters/chain/json-rpc.js"
 
 // Services

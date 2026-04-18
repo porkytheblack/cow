@@ -62,9 +62,20 @@ export const ChainAdapterRegistryLive = Layer.effect(
           break
         }
         case "solana": {
+          const cctp = cctpContractMap[chain.chainId]
           adapters.set(
             chain.chainId,
-            makeSolanaChainAdapter({ chainConfig: chain, fetcher }),
+            makeSolanaChainAdapter({
+              chainConfig: chain,
+              fetcher,
+              cctpContracts: cctp
+                ? {
+                    tokenMessengerMinterProgramId: cctp.tokenMessenger,
+                    messageTransmitterProgramId: cctp.messageTransmitter,
+                    usdcMint: cctp.usdcToken,
+                  }
+                : undefined,
+            }),
           )
           break
         }
@@ -147,24 +158,48 @@ export const makeAptosAwareRegistryLive = (
             )
             break
           }
-          case "solana":
+          case "solana": {
+            const cctp = cctpContractMap[chain.chainId]
             adapters.set(
               chain.chainId,
-              makeSolanaChainAdapter({ chainConfig: chain, fetcher }),
+              makeSolanaChainAdapter({
+                chainConfig: chain,
+                fetcher,
+                cctpContracts: cctp
+                  ? {
+                      tokenMessengerMinterProgramId: cctp.tokenMessenger,
+                      messageTransmitterProgramId: cctp.messageTransmitter,
+                      usdcMint: cctp.usdcToken,
+                    }
+                  : undefined,
+              }),
             )
             break
+          }
           case "aptos": {
             const client = aptosClients.get(chain.chainId)
             if (!client) {
               adapters.set(chain.chainId, makeMockChainAdapter(chain))
               break
             }
+            const cctp = cctpContractMap[chain.chainId]
             adapters.set(
               chain.chainId,
               makeAptosChainAdapter({
                 chainConfig: chain,
                 aptosClient: client,
                 sponsored: sponsoredChains?.has(chain.chainId) ?? false,
+                cctpContracts: cctp
+                  ? {
+                      usdcTokenAddress: cctp.usdcToken,
+                      depositForBurnScript:
+                        cctp.aptosScriptBytecode?.depositForBurn,
+                      depositForBurnWithCallerScript:
+                        cctp.aptosScriptBytecode?.depositForBurnWithCaller,
+                      handleReceiveMessageScript:
+                        cctp.aptosScriptBytecode?.handleReceiveMessage,
+                    }
+                  : undefined,
               }),
             )
             break

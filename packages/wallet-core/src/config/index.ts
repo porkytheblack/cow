@@ -8,10 +8,48 @@ import {
 } from "./defaults.js"
 
 export interface CctpContractAddresses {
+  /**
+   * Source-burn program/module/contract address.
+   *   - EVM: `TokenMessenger` 20-byte hex address.
+   *   - Solana: `TokenMessengerMinter` base58 program ID.
+   *   - Aptos: the Circle CCTP package address (the `@token_messenger_minter`
+   *     named address resolved to its on-chain object) — same value as
+   *     `messageTransmitter`.
+   */
   readonly tokenMessenger: string
+  /**
+   * Destination-mint program/module/contract.
+   *   - EVM: `MessageTransmitter` 20-byte hex address.
+   *   - Solana: `MessageTransmitter` base58 program ID.
+   *   - Aptos: the Circle CCTP package address (the `@message_transmitter`
+   *     named address).
+   */
   readonly messageTransmitter: string
+  /**
+   * The on-chain USDC token reference:
+   *   - EVM: USDC ERC20 20-byte hex address.
+   *   - Solana: USDC SPL mint base58 pubkey.
+   *   - Aptos: USDC fungible-asset metadata object (`0xbae2...6f3b` on mainnet).
+   */
   readonly usdcToken: string
   readonly version?: "v1" | "v2"
+  /**
+   * Aptos-only: the CCTP burn/mint functions are `public fun`s that
+   * take/return non-copyable `FungibleAsset` / `Receipt` types, so they
+   * cannot be called as a plain entry function. Circle ships compiled
+   * Move **scripts** that compose the primitives end-to-end. The wallet
+   * submits these as `TransactionPayloadScript` payloads with typed args.
+   *
+   * Consumers supply the compiled bytecode (e.g. loaded from
+   * `aptos-cctp/packages/token_messenger_minter/scripts/deposit_for_burn.mv`).
+   * Both scripts are required to burn + mint on Aptos; without them the
+   * adapter returns `UnsupportedRouteError`.
+   */
+  readonly aptosScriptBytecode?: {
+    readonly depositForBurn?: Uint8Array
+    readonly depositForBurnWithCaller?: Uint8Array
+    readonly handleReceiveMessage?: Uint8Array
+  }
 }
 
 export interface CctpConfig {
