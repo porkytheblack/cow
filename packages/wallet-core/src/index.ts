@@ -79,6 +79,12 @@ export {
   type AptosAdapterOptions,
   type AptosCctpV1Contracts,
 } from "./adapters/chain/aptos.js"
+export {
+  APTOS_CCTP_V1_MAINNET,
+  APTOS_CCTP_V1_TESTNET,
+  APTOS_USDC_METADATA_MAINNET,
+  APTOS_USDC_METADATA_TESTNET,
+} from "./adapters/chain/aptos-cctp-scripts.js"
 export { jsonRpcCall } from "./adapters/chain/json-rpc.js"
 
 // Services

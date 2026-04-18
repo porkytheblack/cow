@@ -69,6 +69,66 @@ const pending = await wallet.listPendingTransfers()
 for (const t of pending) await wallet.resumeTransfer(t.id)
 ```
 
+#### Receiving USDC on Aptos (CCTP V1)
+
+Aptos is CCTP V1-only until Circle ships V2 there (H1 2026). Burns from
+Ethereum/Arbitrum/Base/etc. destined for Aptos must use the **V1**
+`TokenMessenger` on the source chain — set `version: "v1"` on that chain's
+`CctpContractAddresses`. The library ships Circle's compiled Move scripts
+for Aptos mainnet (`handle_receive_message.mv`, `deposit_for_burn.mv`,
+`deposit_for_burn_with_caller.mv`) so the mint-on-Aptos leg works out of the
+box via `makeAptosAwareRegistryLive`:
+
+```ts
+import {
+  createWalletClient,
+  makeAptosAwareRegistryLive,
+  APTOS_CCTP_V1_MAINNET,   // bundled bytecode + USDC metadata
+} from "cow-wallet"
+import { Aptos, AptosConfig, Network } from "@aptos-labs/ts-sdk"
+
+const aptos = new Aptos(new AptosConfig({ network: Network.MAINNET }))
+const aptosClients = new Map([["aptos", aptos]])
+
+const wallet = await createWalletClient({
+  chains: [
+    { chainId: "aptos", kind: "aptos", name: "Aptos", rpcUrl: "...", cctpDomain: 9, nativeAsset: { chain: "aptos", type: "native", symbol: "APT", decimals: 8 } },
+    { chainId: "evm:1", kind: "evm",   name: "Ethereum", rpcUrl: "...", cctpDomain: 0, nativeAsset: { chain: "evm:1", type: "native", symbol: "ETH", decimals: 18 } },
+  ],
+  cctp: {
+    contractAddresses: {
+      "evm:1": {
+        tokenMessenger:     "0xBd3fa81B58Ba92a82136038B25aDec7066af3155",
+        messageTransmitter: "0x0a992d191DEeC32aFe36203Ad87D7d289a738F81",
+        usdcToken:          "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        version: "v1",    // required — V2 messages can't mint on Aptos
+      },
+      // Aptos entry is optional: omit it to use APTOS_CCTP_V1_MAINNET
+      // automatically, or pass APTOS_CCTP_V1_TESTNET (re-exported) for
+      // testnet. Supply your own entry only if you're pinning a custom
+      // USDC address or re-compiled scripts.
+    },
+  },
+}, {
+  chainRegistry: makeAptosAwareRegistryLive(aptosClients),
+})
+
+await wallet.transfer({
+  from: { chain: "evm:1", address: evmKey.address },
+  to:   { chain: "aptos", address: aptKey.address },
+  asset: wallet.asset("USDC", "evm:1")!,
+  amount: 25_000_000n,
+})
+```
+
+The mint submits a single Move script transaction that atomically chains
+`message_transmitter::receive_message` →
+`token_messenger_minter::handle_receive_message` →
+`message_transmitter::complete_receive_message`. The recipient pays APT gas
+by default; wire a `GasStationTransactionSubmitter` into `aptosClient` and
+pass the chain id to `makeAptosAwareRegistryLive(aptosClients, sponsored)`
+to sponsor it.
+
 ### Arbitrary contract / program / entry-function calls
 
 For anything beyond transfers — contract interactions, program invocations, entry functions — use `sendCall` / `buildCall` / `simulateCall`. They reuse the exact same signing pipeline as `transfer()`, so auth-gate prompts, sessions, and elevated-fee escalation all apply identically.
@@ -249,7 +309,7 @@ All adapters are swappable via the Layer system, which makes testing trivial —
 | Optimism  | `evm`    | secp256k1 / 1559   | V2   | Production             |
 | Avalanche | `evm`    | secp256k1 / 1559   | V2   | Production             |
 | Solana    | `solana` | ed25519            | V1 (scaffolded) | RPC + signing ready |
-| Aptos     | `aptos`  | ed25519            | V1 (scaffolded) | Requires SDK client |
+| Aptos     | `aptos`  | ed25519            | V1 (burn + mint) | Requires SDK client |
 
 Any EVM chain works — just add an entry to `chains` with `kind: "evm"` and the right `chainId: "evm:<numeric-id>"`. Aptos requires a caller-constructed `Aptos` client wired in via `makeAptosAwareRegistryLive`. Aptos Gas Station sponsored transactions are supported via the SDK's `TRANSACTION_SUBMITTER` plugin.
 

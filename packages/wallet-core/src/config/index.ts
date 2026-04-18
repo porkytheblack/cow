@@ -113,7 +113,8 @@ const DEFAULT_AUTH: AuthConfig = {
 }
 
 const DEFAULT_CCTP: CctpConfig = {
-  attestationApiUrl: "https://iris-api.circle.com/v2",
+  // Iris root — `pollCircleAttestation` appends `/v1` or `/v2` per burn.
+  attestationApiUrl: "https://iris-api.circle.com",
   contractAddresses: {},
   attestationPollIntervalMs: DEFAULT_CCTP_POLL_INTERVAL_MS,
   attestationTimeoutMs: DEFAULT_CCTP_TIMEOUT_MS,
