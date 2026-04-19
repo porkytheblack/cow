@@ -4,7 +4,7 @@ import { ChainAdapterRegistry } from "../adapters/chain/index.js"
 import { FetchAdapter } from "../adapters/fetch/index.js"
 import { StorageAdapter } from "../adapters/storage/index.js"
 import { WalletConfigService } from "../config/index.js"
-import type { PendingCctpTransfer } from "../model/cctp.js"
+import type { BurnMessage, PendingCctpTransfer } from "../model/cctp.js"
 import type { TxReceipt } from "../model/transaction.js"
 import type { TransferIntent } from "../model/transfer.js"
 import {
@@ -121,39 +121,124 @@ export const TransferServiceLive = Layer.succeed(TransferService, {
 
         if (step.type === "cctp-burn") {
           const signed = yield* signer.sign(step.tx)
-          const burnReceipt = yield* broadcast.submit(signed)
-          // Parse burn log into a BurnMessage.
           const srcAdapter = yield* registry.get(step.sourceChain)
-          const burnMsg = yield* srcAdapter.extractBurnMessage(burnReceipt)
 
-          const pending: PendingCctpTransfer = {
-            id: newId(),
+          // 1. Persist a `burning` record BEFORE broadcast. The hash is
+          //    already known from the signed tx; `messageBytes` is left
+          //    unset until we can read it back from the confirmed tx.
+          //    A crash or broadcast error after this point leaves us
+          //    with a durable record that resumeTransfer can reconcile.
+          const id = newId()
+          const now = Date.now()
+          const burnStub: BurnMessage = {
+            sourceDomain: 0,
+            destDomain: 0,
+            nonce: 0n,
+            burnTxHash: signed.hash,
+          }
+          const initial: PendingCctpTransfer = {
+            id,
             planId: plan.id,
-            status: "awaiting-attestation",
-            burn: burnMsg,
+            status: "burning",
+            burn: burnStub,
             sourceChain: String(step.sourceChain),
             destChain: String(step.destChain),
             recipient: intent.to.address,
-            createdAt: Date.now(),
-            updatedAt: Date.now(),
+            createdAt: now,
+            updatedAt: now,
           }
-          yield* cctp.savePending(pending)
+          yield* cctp.savePending(initial)
+
+          // 2. Broadcast. On error, probe the chain: the Solana
+          //    `sendTransaction` RPC sometimes returns an error for a tx
+          //    the cluster actually accepted. If we find the burn on
+          //    chain, swallow the broadcast error and extract the
+          //    BurnMessage directly. If the probe is also negative or
+          //    inconclusive, mark the record `failed` and propagate the
+          //    original BroadcastError.
+          type BurnOutcome =
+            | { kind: "receipt"; receipt: TxReceipt }
+            | { kind: "reconciled"; burn: BurnMessage }
+          const outcome: BurnOutcome = yield* broadcast.submit(signed).pipe(
+            Effect.map(
+              (receipt) => ({ kind: "receipt", receipt }) satisfies BurnOutcome,
+            ),
+            Effect.catchTag("BroadcastError", (broadcastErr) =>
+              srcAdapter
+                .extractBurnMessageFromTx(signed.hash)
+                .pipe(
+                  Effect.catchTag("BroadcastError", () =>
+                    Effect.succeed(null as BurnMessage | null),
+                  ),
+                  Effect.flatMap((reconciled) =>
+                    reconciled !== null
+                      ? Effect.succeed({
+                          kind: "reconciled" as const,
+                          burn: reconciled,
+                        } satisfies BurnOutcome)
+                      : cctp
+                          .updatePending(id, {
+                            status: "failed",
+                            updatedAt: Date.now(),
+                          })
+                          .pipe(Effect.flatMap(() => Effect.fail(broadcastErr))),
+                  ),
+                ),
+            ),
+          )
+
+          // 3. Resolve the BurnMessage: either extract from the live
+          //    receipt or reuse the one we already reconciled from chain.
+          const burnMsg: BurnMessage =
+            outcome.kind === "receipt"
+              ? yield* srcAdapter.extractBurnMessage(outcome.receipt)
+              : outcome.burn
+          yield* cctp.updatePending(id, {
+            status: "awaiting-attestation",
+            burn: burnMsg,
+            updatedAt: Date.now(),
+          })
 
           // 4. Wait for Circle attestation.
           const attestation = yield* cctp.waitForAttestation(burnMsg)
+          yield* cctp.updatePending(id, {
+            status: "attested",
+            attestation,
+            updatedAt: Date.now(),
+          })
 
-          // 5. Build & submit the mint on the destination chain.
+          // 5. Build + sign the mint. Save `minting` before broadcast so
+          //    a broadcast error here also leaves a recoverable record.
           const mintTx = yield* cctp.buildMintTx(
             intent.to.address,
             step.destChain,
             attestation,
           )
           const mintSigned = yield* signer.sign(mintTx)
+          yield* cctp.updatePending(id, {
+            status: "minting",
+            mintTxHash: mintSigned.hash,
+            updatedAt: Date.now(),
+          })
           const mintReceipt = yield* broadcast.submit(mintSigned)
+          yield* cctp.updatePending(id, {
+            status: "completed",
+            mintTxHash: mintReceipt.hash,
+            updatedAt: Date.now(),
+          })
+
+          const finalRecord: PendingCctpTransfer = {
+            ...initial,
+            status: "completed",
+            burn: burnMsg,
+            attestation,
+            mintTxHash: mintReceipt.hash,
+            updatedAt: Date.now(),
+          }
           completed.push({
             type: "cctp",
             receipt: mintReceipt,
-            pendingCctp: { ...pending, status: "completed", attestation },
+            pendingCctp: finalRecord,
           })
           continue
         }

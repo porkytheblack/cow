@@ -20,10 +20,58 @@ interface MockState {
   nonceCounter: bigint
   /** Overrides the next simulateCall response. Consumed on use. */
   nextSimulation?: CallSimulation
+  /**
+   * Controls what `broadcast` does on the next call. `reject` forces it
+   * to fail with a `BroadcastError`, optionally leaving a "landed"
+   * receipt behind that `extractBurnMessageFromTx` will surface — the
+   * racey-broadcast case we're guarding against in production.
+   */
+  nextBroadcastBehavior?: {
+    reject: boolean
+    landReceiptAnyway: boolean
+  }
 }
 
 const balanceKey = (address: string, asset: AssetId) =>
   `${address}::${asset.symbol}`
+
+const synthBurnFromReceipt = (
+  config: ChainConfig,
+  hash: string,
+  raw: unknown,
+): BurnMessage => {
+  const payload = raw as {
+    kind?: string
+    destDomain?: number
+    amount?: string
+    recipient?: string
+  }
+  if (payload?.kind !== "cctp-burn") {
+    throw new BroadcastError({
+      chain: config.chainId,
+      hash,
+      cause: "receipt is not a CCTP burn",
+    })
+  }
+  const messageBytes = new TextEncoder().encode(
+    JSON.stringify({
+      src: config.chainId,
+      dstDomain: payload.destDomain,
+      amount: payload.amount,
+      recipient: payload.recipient,
+      burnTxHash: hash,
+    }),
+  )
+  const messageHash = bytesToHex(sha256(messageBytes))
+  return {
+    sourceDomain: config.cctpDomain ?? 0,
+    destDomain: payload.destDomain ?? 0,
+    nonce: BigInt("0x" + messageHash.slice(0, 16)),
+    burnTxHash: hash,
+    messageBytes,
+    messageHash,
+  }
+}
 
 /**
  * Deterministic mock chain adapter for tests. Keeps an in-memory ledger
@@ -92,6 +140,32 @@ export const makeMockChainAdapter = (config: ChainConfig): ChainAdapter => {
           amount?: string
           destDomain?: number
           recipient?: string
+        }
+
+        const behavior = state.nextBroadcastBehavior
+        if (behavior) {
+          state.nextBroadcastBehavior = undefined
+          if (behavior.reject) {
+            if (behavior.landReceiptAnyway) {
+              // Simulate the Solana sendTransaction quirk: RPC returns an
+              // error but the cluster actually accepted + executed the tx.
+              // Stash a receipt so `extractBurnMessageFromTx` finds it.
+              const landed: TxReceipt = {
+                chain: config.chainId,
+                hash: signed.hash,
+                status: "confirmed",
+                blockNumber: state.nonceCounter++,
+                fee: 1_000n,
+                raw: payload,
+              }
+              state.receipts.set(signed.hash, landed)
+            }
+            throw new BroadcastError({
+              chain: config.chainId,
+              hash: signed.hash,
+              cause: "mock: broadcast rejected",
+            })
+          }
         }
 
         if (payload.kind === "direct-transfer" && payload.asset && payload.amount) {
@@ -261,46 +335,26 @@ export const makeMockChainAdapter = (config: ChainConfig): ChainAdapter => {
       }),
 
     extractBurnMessage: (receipt) =>
-      Effect.sync(() => {
-        const payload = receipt.raw as {
-          kind: string
-          destDomain?: number
-          amount?: string
-          recipient?: string
-        }
-        if (payload.kind !== "cctp-burn") {
-          throw new BroadcastError({
-            chain: config.chainId,
-            hash: receipt.hash,
-            cause: "receipt is not a CCTP burn",
-          })
-        }
-        const messageBytes = new TextEncoder().encode(
-          JSON.stringify({
-            src: config.chainId,
-            dstDomain: payload.destDomain,
-            amount: payload.amount,
-            recipient: payload.recipient,
-            burnTxHash: receipt.hash,
-          }),
-        )
-        const messageHash = bytesToHex(sha256(messageBytes))
-        const burn: BurnMessage = {
-          sourceDomain: config.cctpDomain ?? 0,
-          destDomain: payload.destDomain ?? 0,
-          nonce: BigInt("0x" + messageHash.slice(0, 16)),
-          burnTxHash: receipt.hash,
-          messageBytes,
-          messageHash,
-        }
-        return burn
-      }).pipe(
+      Effect.sync(() =>
+        synthBurnFromReceipt(config, receipt.hash, receipt.raw),
+      ).pipe(
         Effect.catchAllDefect((defect) =>
           defect instanceof BroadcastError
             ? Effect.fail(defect)
             : Effect.die(defect),
         ),
       ) as Effect.Effect<BurnMessage, BroadcastError>,
+
+    extractBurnMessageFromTx: (hash) =>
+      Effect.sync(() => {
+        const receipt = state.receipts.get(hash)
+        if (!receipt) return null
+        try {
+          return synthBurnFromReceipt(config, hash, receipt.raw)
+        } catch {
+          return null
+        }
+      }),
 
     buildMintTx: ({ recipient, messageBytes, attestation }) =>
       Effect.sync(() => ({
@@ -324,14 +378,24 @@ export const makeMockChainAdapter = (config: ChainConfig): ChainAdapter => {
     state.nextSimulation = sim
   }
 
+  const seedBroadcastBehavior = (
+    behavior: { reject: boolean; landReceiptAnyway: boolean } | undefined,
+  ) => {
+    state.nextBroadcastBehavior = behavior
+  }
+
   // Expose seeding for tests via a hidden handle.
   ;(adapter as unknown as {
     __seed: typeof seedBalance
     __seedSimulation: typeof seedSimulation
+    __seedBroadcastBehavior: typeof seedBroadcastBehavior
   }).__seed = seedBalance
   ;(adapter as unknown as {
     __seedSimulation: typeof seedSimulation
   }).__seedSimulation = seedSimulation
+  ;(adapter as unknown as {
+    __seedBroadcastBehavior: typeof seedBroadcastBehavior
+  }).__seedBroadcastBehavior = seedBroadcastBehavior
 
   return adapter
 }

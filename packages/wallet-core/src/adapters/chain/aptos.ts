@@ -650,88 +650,30 @@ export const makeAptosChainAdapter = (
       }).pipe(Effect.catchAll(() => Effect.succeed([] as readonly TokenBalance[]))),
 
     extractBurnMessage: (receipt) =>
+      decodeBurnFromAptosRaw(chainConfig, receipt.hash, receipt.raw),
+
+    extractBurnMessageFromTx: (hash) =>
       Effect.gen(function* () {
-        // `cctpBurn` takes precedence so callers that pre-parse the
-        // burn (tests, custom receipt pipelines) aren't second-guessed.
-        const raw = receipt.raw as
-          | {
-              cctpBurn?: {
-                sourceDomain: number
-                destDomain: number
-                nonce: string
-                messageHex: string
-                messageHash: string
-              }
-              events?: ReadonlyArray<{
-                readonly type?: string
-                readonly data?: unknown
-              }>
-            }
-          | null
-
-        if (raw?.cctpBurn) {
-          const b = raw.cctpBurn
-          return {
-            sourceDomain: b.sourceDomain,
-            destDomain: b.destDomain,
-            nonce: BigInt(b.nonce),
-            burnTxHash: receipt.hash,
-            messageBytes: hexToBytes(b.messageHex),
-            messageHash: b.messageHash,
-          } satisfies BurnMessage
-        }
-
-        const events = raw?.events ?? []
-        // The payload-shape check guards against unrelated MessageSent
-        // events other packages might emit.
-        const messageSent = events.find((ev) => {
-          if (typeof ev.type !== "string") return false
-          if (!ev.type.endsWith(CIRCLE_MESSAGE_SENT_EVENT_SUFFIX)) return false
-          const data = ev.data as { message?: unknown } | null
-          return typeof data?.message === "string"
-        })
-        if (!messageSent) {
-          return yield* Effect.fail(
-            new BroadcastError({
-              chain: String(chainConfig.chainId),
-              hash: receipt.hash,
-              cause:
-                "Aptos receipt has no MessageSent event and no raw.cctpBurn override",
-            }),
-          )
-        }
-
-        const msgHex = (
-          (messageSent.data as { message: string }).message
-        ).replace(/^0x/i, "")
-        if (msgHex.length < 2 * 24) {
-          return yield* Effect.fail(
-            new BroadcastError({
-              chain: String(chainConfig.chainId),
-              hash: receipt.hash,
-              cause: `MessageSent payload too short (${msgHex.length / 2} bytes)`,
-            }),
-          )
-        }
-        const messageBytes = hexToBytes(msgHex)
-        // CCTP V1 header: version(4) | sourceDomain(4) | destDomain(4) | nonce(8) | ...
-        const view = new DataView(
-          messageBytes.buffer,
-          messageBytes.byteOffset,
-          messageBytes.byteLength,
+        const tx = yield* Effect.tryPromise({
+          try: () => aptosClient.getTransactionByHash({ transactionHash: hash }),
+          catch: () => null,
+        }).pipe(Effect.catchAll(() => Effect.succeed(null)))
+        if (!tx) return null
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const t = tx as any
+        // Only user txs carry events; `pending_transaction` has no type
+        // field matching this shape.
+        if (t.type !== "user_transaction") return null
+        if (t.success === false) return null
+        const events = Array.isArray(t.events) ? t.events : []
+        return yield* decodeBurnFromAptosRaw(chainConfig, hash, { events }).pipe(
+          // Swallow decode failures and treat them as "not visible yet":
+          // the tx may be from an unrelated package that has no
+          // MessageSent event, which is not an error for the reconcile
+          // path — callers keep the record in `burning` and retry.
+          Effect.map((burn) => burn as BurnMessage | null),
+          Effect.catchAll(() => Effect.succeed(null)),
         )
-        const sourceDomain = view.getUint32(4, false)
-        const destDomain = view.getUint32(8, false)
-        const nonce = view.getBigUint64(12, false)
-        const messageHash = bytesToHex(keccak_256(messageBytes))
-        return {
-          sourceDomain,
-          destDomain,
-          nonce,
-          burnTxHash: receipt.hash,
-          messageBytes,
-          messageHash,
-        } satisfies BurnMessage
       }),
 
     buildMintTx: ({ recipient, messageBytes, attestation }) =>
@@ -791,3 +733,92 @@ export const makeAptosChainAdapter = (
 
   return adapter
 }
+
+/**
+ * Shared decoder for Aptos CCTP burn messages. Accepts either the
+ * `{ cctpBurn }` pre-parsed shape (used by tests and custom pipelines)
+ * or `{ events }` as returned by `aptosClient.waitForTransaction` /
+ * `aptosClient.getTransactionByHash`.
+ */
+const decodeBurnFromAptosRaw = (
+  chainConfig: ChainConfig,
+  hash: string,
+  raw: unknown,
+): Effect.Effect<BurnMessage, BroadcastError> =>
+  Effect.gen(function* () {
+    const r = raw as
+      | {
+          cctpBurn?: {
+            sourceDomain: number
+            destDomain: number
+            nonce: string
+            messageHex: string
+            messageHash: string
+          }
+          events?: ReadonlyArray<{
+            readonly type?: string
+            readonly data?: unknown
+          }>
+        }
+      | null
+
+    if (r?.cctpBurn) {
+      const b = r.cctpBurn
+      return {
+        sourceDomain: b.sourceDomain,
+        destDomain: b.destDomain,
+        nonce: BigInt(b.nonce),
+        burnTxHash: hash,
+        messageBytes: hexToBytes(b.messageHex),
+        messageHash: b.messageHash,
+      } satisfies BurnMessage
+    }
+
+    const events = r?.events ?? []
+    const messageSent = events.find((ev) => {
+      if (typeof ev.type !== "string") return false
+      if (!ev.type.endsWith(CIRCLE_MESSAGE_SENT_EVENT_SUFFIX)) return false
+      const data = ev.data as { message?: unknown } | null
+      return typeof data?.message === "string"
+    })
+    if (!messageSent) {
+      return yield* Effect.fail(
+        new BroadcastError({
+          chain: String(chainConfig.chainId),
+          hash,
+          cause:
+            "Aptos receipt has no MessageSent event and no raw.cctpBurn override",
+        }),
+      )
+    }
+    const msgHex = (
+      (messageSent.data as { message: string }).message
+    ).replace(/^0x/i, "")
+    if (msgHex.length < 2 * 24) {
+      return yield* Effect.fail(
+        new BroadcastError({
+          chain: String(chainConfig.chainId),
+          hash,
+          cause: `MessageSent payload too short (${msgHex.length / 2} bytes)`,
+        }),
+      )
+    }
+    const messageBytes = hexToBytes(msgHex)
+    const view = new DataView(
+      messageBytes.buffer,
+      messageBytes.byteOffset,
+      messageBytes.byteLength,
+    )
+    const sourceDomain = view.getUint32(4, false)
+    const destDomain = view.getUint32(8, false)
+    const nonce = view.getBigUint64(12, false)
+    const messageHash = bytesToHex(keccak_256(messageBytes))
+    return {
+      sourceDomain,
+      destDomain,
+      nonce,
+      burnTxHash: hash,
+      messageBytes,
+      messageHash,
+    } satisfies BurnMessage
+  })

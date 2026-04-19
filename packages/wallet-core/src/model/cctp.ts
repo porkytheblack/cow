@@ -1,10 +1,24 @@
 export interface BurnMessage {
   readonly sourceDomain: number
   readonly destDomain: number
+  /**
+   * Filled once the burn tx is confirmed on-chain. May be `0n` as a
+   * placeholder when a record is first persisted pre-broadcast in the
+   * `"burning"` status — consumers should only read `nonce` when
+   * `messageBytes` is defined (i.e. the burn has been reconciled
+   * against the chain).
+   */
   readonly nonce: bigint
   readonly burnTxHash: string
-  readonly messageBytes: Uint8Array
-  readonly messageHash: string
+  /**
+   * The CCTP message bytes extracted from the confirmed burn. Absent
+   * while a record is still in the `"burning"` status — the burn tx
+   * has been signed and handed to the RPC but we have not yet read
+   * back its on-chain state.
+   */
+  readonly messageBytes?: Uint8Array
+  /** Keccak-256 of `messageBytes`, hex-encoded (no 0x prefix). */
+  readonly messageHash?: string
 }
 
 export interface Attestation {

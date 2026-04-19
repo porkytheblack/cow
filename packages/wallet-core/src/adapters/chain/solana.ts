@@ -8,6 +8,7 @@ import {
   TransactionInstruction,
 } from "@solana/web3.js"
 import { ed25519 } from "@noble/curves/ed25519"
+import { keccak_256 } from "@noble/hashes/sha3"
 import { sha256 } from "@noble/hashes/sha256"
 import { bytesToHex, hexToBytes, randomBytes } from "@noble/hashes/utils"
 import { base58Encode, base58Decode } from "../../services/keyring-crypto.js"
@@ -109,6 +110,13 @@ const u32BeFromBytes = (bytes: Uint8Array, offset: number): number =>
     (bytes[offset + 1]! << 16) |
     (bytes[offset + 2]! << 8) |
     bytes[offset + 3]!) >>>
+  0
+
+const u32LeFromBytes = (bytes: Uint8Array, offset: number): number =>
+  (bytes[offset]! |
+    (bytes[offset + 1]! << 8) |
+    (bytes[offset + 2]! << 16) |
+    (bytes[offset + 3]! << 24)) >>>
   0
 
 const u64BeFromBytes = (bytes: Uint8Array, offset: number): bigint => {
@@ -1080,27 +1088,46 @@ export const makeSolanaChainAdapter = (
               }
             }
           | null
-        if (!raw || !raw.cctpBurn) {
+        if (raw?.cctpBurn) {
+          const b = raw.cctpBurn
+          const burn: BurnMessage = {
+            sourceDomain: b.sourceDomain,
+            destDomain: b.destDomain,
+            nonce: BigInt(b.nonce),
+            burnTxHash: receipt.hash,
+            messageBytes: base58Decode(b.messageBytesBase58),
+            messageHash: b.messageHash,
+          }
+          return burn
+        }
+        // Fall back to on-chain reconciliation: read the tx + the
+        // `message_sent_event_data` account directly.
+        const reconciled = yield* extractBurnMessageFromSolanaTx(
+          rpc,
+          chainConfig,
+          cctp.tokenMessengerMinterProgramId,
+          receipt.hash,
+        )
+        if (!reconciled) {
           return yield* Effect.fail(
             new BroadcastError({
               chain: String(chainConfig.chainId),
               hash: receipt.hash,
               cause:
-                "Solana receipt has no cctpBurn metadata; configure the adapter with a Solana CCTP parser",
+                "Solana receipt has no cctpBurn metadata and on-chain reconciliation yielded no MessageSent account",
             }),
           )
         }
-        const b = raw.cctpBurn
-        const burn: BurnMessage = {
-          sourceDomain: b.sourceDomain,
-          destDomain: b.destDomain,
-          nonce: BigInt(b.nonce),
-          burnTxHash: receipt.hash,
-          messageBytes: base58Decode(b.messageBytesBase58),
-          messageHash: b.messageHash,
-        }
-        return burn
+        return reconciled
       }),
+
+    extractBurnMessageFromTx: (hash) =>
+      extractBurnMessageFromSolanaTx(
+        rpc,
+        chainConfig,
+        cctp.tokenMessengerMinterProgramId,
+        hash,
+      ),
 
     buildMintTx: ({ recipient, messageBytes, attestation }) =>
       Effect.gen(function* () {
@@ -1173,3 +1200,132 @@ export const makeSolanaChainAdapter = (
 
   return adapter
 }
+
+// --- Reconciliation helper ---------------------------------------------
+
+interface SolanaTxResponse {
+  readonly meta?: {
+    readonly err?: unknown
+  } | null
+  readonly transaction?: {
+    readonly message?: {
+      readonly accountKeys?: readonly string[]
+      readonly instructions?: ReadonlyArray<{
+        readonly programIdIndex?: number
+        readonly accounts?: readonly number[]
+      }>
+    }
+  }
+}
+
+interface SolanaAccountInfoResponse {
+  readonly value: {
+    readonly data: readonly [string, string] | string
+  } | null
+}
+
+/**
+ * Reconcile a Solana CCTP burn against the cluster: given a signature,
+ * fetch the transaction, locate the CCTP `deposit_for_burn` ix, pull
+ * the `message_sent_event_data` account key from its account list, and
+ * read the `MessageSent` Anchor account data.
+ *
+ * Layout of the `MessageSent` account:
+ *
+ *   [ 8 bytes  discriminator
+ *   | 32 bytes rent_payer
+ *   | 8 bytes  created_at (i64 LE)
+ *   | 4 bytes  message length (u32 LE)  ← Anchor Vec<u8> prefix
+ *   | N bytes  message ]
+ *
+ * Returns `null` when the tx is not yet visible, has reverted, or the
+ * `MessageSent` account has been closed (rent reclaimed). The caller
+ * treats `null` as "not confirmed yet" and retries.
+ */
+const extractBurnMessageFromSolanaTx = (
+  rpc: <T>(method: string, params?: unknown) => Effect.Effect<T, unknown>,
+  _chainConfig: ChainConfig,
+  tokenMessengerMinterProgramId: string,
+  signature: string,
+): Effect.Effect<BurnMessage | null, BroadcastError> =>
+  Effect.gen(function* () {
+    const txRes = yield* rpc<SolanaTxResponse | null>("getTransaction", [
+      signature,
+      {
+        commitment: "confirmed",
+        encoding: "json",
+        maxSupportedTransactionVersion: 0,
+      },
+    ]).pipe(Effect.catchAll(() => Effect.succeed(null)))
+    if (!txRes) return null
+    if (txRes.meta?.err != null) return null
+
+    const message = txRes.transaction?.message
+    const accountKeys = message?.accountKeys ?? []
+    const instructions = message?.instructions ?? []
+    if (accountKeys.length === 0 || instructions.length === 0) return null
+
+    // Locate the deposit_for_burn ix: programId matches the
+    // TokenMessengerMinter program, account at index 10 is
+    // message_sent_event_data (per buildSolanaCctpBurnInstructions).
+    let eventAccountKey: string | undefined
+    for (const ix of instructions) {
+      if (ix.programIdIndex === undefined) continue
+      const progId = accountKeys[ix.programIdIndex]
+      if (progId !== tokenMessengerMinterProgramId) continue
+      const accounts = ix.accounts ?? []
+      if (accounts.length < 11) continue
+      const idx = accounts[10]!
+      const key = accountKeys[idx]
+      if (key) {
+        eventAccountKey = key
+        break
+      }
+    }
+    if (!eventAccountKey) return null
+
+    const info = yield* rpc<SolanaAccountInfoResponse>("getAccountInfo", [
+      eventAccountKey,
+      { encoding: "base64" },
+    ]).pipe(Effect.catchAll(() => Effect.succeed({ value: null } as SolanaAccountInfoResponse)))
+    if (!info.value) return null
+
+    const raw = Array.isArray(info.value.data)
+      ? info.value.data[0]
+      : info.value.data
+    if (typeof raw !== "string") return null
+    let accountBytes: Uint8Array
+    try {
+      accountBytes = base64Decode(raw)
+    } catch {
+      return null
+    }
+    // 8 (disc) + 32 (rent_payer) + 8 (i64 created_at) + 4 (u32 len)
+    const MSG_LEN_OFFSET = 48
+    if (accountBytes.length < MSG_LEN_OFFSET + 4) return null
+    const msgLen = u32LeFromBytes(accountBytes, MSG_LEN_OFFSET)
+    const msgStart = MSG_LEN_OFFSET + 4
+    if (accountBytes.length < msgStart + msgLen) return null
+    const messageBytes = accountBytes.slice(msgStart, msgStart + msgLen)
+    if (messageBytes.length < 24) return null
+
+    // CCTP V1 header: version(4) | sourceDomain(4) | destDomain(4) | nonce(8) ...
+    // All big-endian.
+    const view = new DataView(
+      messageBytes.buffer,
+      messageBytes.byteOffset,
+      messageBytes.byteLength,
+    )
+    const sourceDomain = view.getUint32(4, false)
+    const destDomain = view.getUint32(8, false)
+    const nonce = view.getBigUint64(12, false)
+    const messageHash = bytesToHex(keccak_256(messageBytes))
+    return {
+      sourceDomain,
+      destDomain,
+      nonce,
+      burnTxHash: signature,
+      messageBytes,
+      messageHash,
+    } satisfies BurnMessage
+  })
