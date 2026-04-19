@@ -783,48 +783,32 @@ export const makeEvmChainAdapter = (
       }),
 
     extractBurnMessage: (receipt) =>
+      decodeBurnMessageFromLogs(
+        chainConfig,
+        receipt.hash,
+        (receipt.raw as { logs?: Array<{ topics: string[]; data: string }> } | null)
+          ?.logs,
+      ),
+
+    extractBurnMessageFromTx: (hash) =>
       Effect.gen(function* () {
-        // The MessageTransmitter emits a `MessageSent(bytes message)` event.
-        // Its topic hash is keccak256("MessageSent(bytes)") =
-        //   0x8c5261668696ce22758910d05bab8f186d6eb247ceac2af2e82c7dc17669b036
-        const MESSAGE_SENT_TOPIC =
-          "0x8c5261668696ce22758910d05bab8f186d6eb247ceac2af2e82c7dc17669b036"
-        const raw = receipt.raw as { logs?: Array<{ topics: string[]; data: string }> } | null
-        if (!raw || !raw.logs) {
-          return yield* Effect.fail(
-            new BroadcastError({
-              chain: String(chainConfig.chainId),
-              hash: receipt.hash,
-              cause: "no logs in receipt",
-            }),
-          )
-        }
-        const log = raw.logs.find((l) => l.topics[0] === MESSAGE_SENT_TOPIC)
-        if (!log) {
-          return yield* Effect.fail(
-            new BroadcastError({
-              chain: String(chainConfig.chainId),
-              hash: receipt.hash,
-              cause: "no MessageSent log in receipt",
-            }),
-          )
-        }
-        // The event data is ABI-encoded: offset (32) + length (32) + bytes.
-        // We decode the dynamic-bytes payload.
-        const dataHex = log.data.startsWith("0x") ? log.data.slice(2) : log.data
-        const len = parseInt(dataHex.slice(64, 128), 16)
-        const messageHex = dataHex.slice(128, 128 + len * 2)
-        const messageBytes = hexToBytes(messageHex)
-        const messageHash = keccak256(`0x${messageHex}` as Hex).slice(2)
-        const burn: BurnMessage = {
-          sourceDomain: chainConfig.cctpDomain ?? 0,
-          destDomain: 0,
-          nonce: 0n,
-          burnTxHash: receipt.hash,
-          messageBytes,
-          messageHash,
-        }
-        return burn
+        const receipt = yield* rpc<{
+          status: string
+          blockNumber: string
+          gasUsed: string
+          logs?: Array<{ topics: string[]; data: string }>
+        } | null>("eth_getTransactionReceipt", [hash]).pipe(
+          Effect.catchAll(() => Effect.succeed(null)),
+        )
+        if (!receipt) return null
+        // `status === "0x1"` = success; any other value means the tx was
+        // mined but reverted — no MessageSent log will be present.
+        if (receipt.status !== "0x1") return null
+        return yield* decodeBurnMessageFromLogs(
+          chainConfig,
+          hash,
+          receipt.logs,
+        )
       }),
 
     buildMintTx: ({ recipient, messageBytes, attestation }) =>
@@ -939,3 +923,49 @@ export const buildEvmCctpBurnTx = (
  * inspect raw signed EVM transactions.
  */
 export { serializeTransaction, parseTransaction }
+
+// CCTP MessageTransmitter emits `MessageSent(bytes message)`.
+// topic0 = keccak256("MessageSent(bytes)").
+const MESSAGE_SENT_TOPIC =
+  "0x8c5261668696ce22758910d05bab8f186d6eb247ceac2af2e82c7dc17669b036"
+
+const decodeBurnMessageFromLogs = (
+  chainConfig: ChainConfig,
+  hash: string,
+  logs: ReadonlyArray<{ topics: string[]; data: string }> | undefined,
+): Effect.Effect<BurnMessage, BroadcastError> =>
+  Effect.gen(function* () {
+    if (!logs) {
+      return yield* Effect.fail(
+        new BroadcastError({
+          chain: String(chainConfig.chainId),
+          hash,
+          cause: "no logs in receipt",
+        }),
+      )
+    }
+    const log = logs.find((l) => l.topics[0] === MESSAGE_SENT_TOPIC)
+    if (!log) {
+      return yield* Effect.fail(
+        new BroadcastError({
+          chain: String(chainConfig.chainId),
+          hash,
+          cause: "no MessageSent log in receipt",
+        }),
+      )
+    }
+    // Dynamic-bytes ABI encoding: offset(32) | length(32) | payload.
+    const dataHex = log.data.startsWith("0x") ? log.data.slice(2) : log.data
+    const len = parseInt(dataHex.slice(64, 128), 16)
+    const messageHex = dataHex.slice(128, 128 + len * 2)
+    const messageBytes = hexToBytes(messageHex)
+    const messageHash = keccak256(`0x${messageHex}` as Hex).slice(2)
+    return {
+      sourceDomain: chainConfig.cctpDomain ?? 0,
+      destDomain: 0,
+      nonce: 0n,
+      burnTxHash: hash,
+      messageBytes,
+      messageHash,
+    } satisfies BurnMessage
+  })

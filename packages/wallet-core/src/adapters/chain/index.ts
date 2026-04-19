@@ -148,6 +148,28 @@ export interface ChainAdapter {
   ) => Effect.Effect<BurnMessage, BroadcastError>
 
   /**
+   * Given a burn tx hash, re-fetch its on-chain state and extract the
+   * CCTP `BurnMessage`. Returns `null` when the tx is not yet visible
+   * or still unconfirmed — callers should retry with backoff.
+   *
+   * Unlike `extractBurnMessage`, which consumes a `TxReceipt` that the
+   * local `broadcast` call produced, this method is safe to call after
+   * a broadcast error: it probes the chain directly via the injected
+   * FetchAdapter. Used by `TransferServiceLive.execute` and
+   * `CctpService.resumePending` to reconcile a signed-but-uncertain
+   * burn against the chain.
+   *
+   * Adapters that can't cheaply fetch the full message from a hash
+   * alone (e.g. Solana needs the ephemeral `message_sent_event_data`
+   * account) may return a partial `BurnMessage` with `messageBytes`
+   * unset — the caller checks for that and keeps the record in
+   * `"burning"` until a later reconciliation fills it in.
+   */
+  readonly extractBurnMessageFromTx: (
+    hash: string,
+  ) => Effect.Effect<BurnMessage | null, BroadcastError>
+
+  /**
    * Build the mint / receiveMessage transaction on this chain given a
    * Circle attestation. Source adapter produces the burn; destination
    * adapter produces the mint.
