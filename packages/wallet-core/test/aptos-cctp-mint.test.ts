@@ -153,7 +153,7 @@ describe("Aptos extractBurnMessage", () => {
     expect(burn.nonce).toBe(1234n)
     expect(burn.burnTxHash).toBe("0xdeadbeef")
     expect(burn.messageHash).toBe(expectedHash)
-    expect(Array.from(burn.messageBytes)).toEqual(Array.from(msg))
+    expect(Array.from(burn.messageBytes!)).toEqual(Array.from(msg))
   })
 
   it("falls back to receipt.raw.cctpBurn when no events match", async () => {

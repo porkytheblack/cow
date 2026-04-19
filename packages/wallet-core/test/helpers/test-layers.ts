@@ -13,6 +13,17 @@ import { testConfig as defaultTestConfig } from "./test-config.js"
 export interface TestHarness {
   readonly layer: WalletLayer
   readonly seed: (address: string, asset: AssetId, amount: bigint) => void
+  /**
+   * Seed the next `broadcast` call on a chain adapter to behave a
+   * specific way. `reject: true` forces it to throw a `BroadcastError`;
+   * `landReceiptAnyway: true` additionally records a "confirmed"
+   * receipt — the exact race `TransferService.execute` needs to
+   * reconcile through `extractBurnMessageFromTx`.
+   */
+  readonly seedBroadcast: (
+    chain: ChainId,
+    behavior: { reject: boolean; landReceiptAnyway: boolean },
+  ) => void
   readonly adapters: ReadonlyMap<ChainId, ChainAdapter>
   readonly config: WalletConfig
 }
@@ -45,6 +56,19 @@ export const makeTestHarness = (
     seedFn(address, asset, amount)
   }
 
+  const seedBroadcast = (
+    chain: ChainId,
+    behavior: { reject: boolean; landReceiptAnyway: boolean },
+  ) => {
+    const adapter = adapters.get(chain)
+    if (!adapter) throw new Error(`No adapter for chain ${String(chain)}`)
+    ;(adapter as unknown as {
+      __seedBroadcastBehavior: (
+        b: { reject: boolean; landReceiptAnyway: boolean } | undefined,
+      ) => void
+    }).__seedBroadcastBehavior(behavior)
+  }
+
   const chainRegistryLayer = makeChainAdapterRegistryLayer(adapters)
 
   // Mock fetch that returns a completed Circle attestation immediately.
@@ -75,5 +99,5 @@ export const makeTestHarness = (
     fetch: mockFetch,
   })
 
-  return { layer, seed, adapters, config }
+  return { layer, seed, seedBroadcast, adapters, config }
 }

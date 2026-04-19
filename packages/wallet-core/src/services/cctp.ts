@@ -72,6 +72,16 @@ export interface CctpServiceShape {
   >
 
   /**
+   * Apply a shallow patch to a persisted pending transfer without
+   * round-tripping the whole record. A no-op if the id is absent.
+   * `updatedAt` is set automatically when the caller does not supply one.
+   */
+  readonly updatePending: (
+    id: string,
+    patch: Partial<PendingCctpTransfer>,
+  ) => Effect.Effect<void, StorageError, StorageAdapter>
+
+  /**
    * Resume a pending CCTP transfer after restart. Picks up from whichever
    * step was persisted last: awaits attestation if burn is stored, then
    * builds + signs + broadcasts the mint, and updates the persisted status.
@@ -176,10 +186,20 @@ export const CctpServiceLive = Layer.succeed(CctpService, {
     Effect.gen(function* () {
       const registry = yield* ChainAdapterRegistry
       const adapter = yield* registry.get(destChain)
+      const messageBytes = attestation.message.messageBytes
+      if (!messageBytes) {
+        return yield* Effect.fail(
+          new CctpMintError({
+            destChain,
+            cause:
+              "attestation is missing messageBytes — burn has not been reconciled against the source chain",
+          }),
+        )
+      }
       const tx = yield* adapter
         .buildMintTx({
           recipient,
-          messageBytes: attestation.message.messageBytes,
+          messageBytes,
           attestation: attestation.attestation,
         })
         .pipe(
@@ -220,6 +240,31 @@ export const CctpServiceLive = Layer.succeed(CctpService, {
       return results
     }),
 
+  updatePending: (id, patch) =>
+    Effect.gen(function* () {
+      const storage = yield* StorageAdapter
+      const key = `${STORAGE_PREFIX}${id}`
+      const bytes = yield* storage.load(key)
+      if (!bytes) return
+      let current: PendingCctpTransfer
+      try {
+        current = deserialisePending(
+          JSON.parse(textDecoder.decode(bytes)) as SerialisedPending,
+        )
+      } catch {
+        return
+      }
+      const merged: PendingCctpTransfer = {
+        ...current,
+        ...patch,
+        updatedAt: patch.updatedAt ?? Date.now(),
+      }
+      yield* storage.save(
+        key,
+        textEncoder.encode(JSON.stringify(serialisePending(merged))),
+      )
+    }),
+
   resumePending: (id, recipientOverride, destChainOverride) =>
     Effect.gen(function* () {
       const storage = yield* StorageAdapter
@@ -227,7 +272,8 @@ export const CctpServiceLive = Layer.succeed(CctpService, {
       const broadcast = yield* BroadcastService
       const fetcher = yield* FetchAdapter
       const configService = yield* WalletConfigService
-      const cctp = configService.config.cctp
+      const cctpConfig = configService.config.cctp
+      const registry = yield* ChainAdapterRegistry
 
       const key = `${STORAGE_PREFIX}${id}`
       const bytes = yield* storage.load(key)
@@ -275,10 +321,56 @@ export const CctpServiceLive = Layer.succeed(CctpService, {
           }),
         )
       }
+      let burn: BurnMessage = current.burn
+
+      // 0. If the record is still in `"burning"` — save-before-broadcast
+      //    left us here — reconcile against the source chain first. The
+      //    sourceChain may be absent on old records; we skip reconciliation
+      //    in that case and fall through (only burns from post-fix
+      //    versions store `sourceChain`).
+      if (current.status === "burning" && current.sourceChain) {
+        const srcAdapter = yield* registry.get(current.sourceChain)
+        const reconciled = yield* srcAdapter
+          .extractBurnMessageFromTx(burn.burnTxHash)
+          .pipe(
+            Effect.catchTag("BroadcastError", () =>
+              Effect.succeed(null as BurnMessage | null),
+            ),
+          )
+        if (!reconciled) {
+          return yield* Effect.fail(
+            new CctpMintError({
+              destChain,
+              cause:
+                "burn tx not yet visible on source chain — cannot advance; try again later",
+            }),
+          )
+        }
+        burn = reconciled
+        current = {
+          ...current,
+          status: "awaiting-attestation",
+          burn: reconciled,
+          updatedAt: Date.now(),
+        }
+        yield* storage.save(
+          key,
+          textEncoder.encode(JSON.stringify(serialisePending(current))),
+        )
+      }
 
       // 1. Get (or wait for) the attestation.
       let attestation = current.attestation
       if (!attestation) {
+        if (!burn.messageBytes || !burn.messageHash) {
+          return yield* Effect.fail(
+            new CctpMintError({
+              destChain,
+              cause:
+                "burn record is missing messageBytes/messageHash — source chain has not been reconciled",
+            }),
+          )
+        }
         const awaiting: PendingCctpTransfer = {
           ...current,
           status: "awaiting-attestation",
@@ -290,15 +382,15 @@ export const CctpServiceLive = Layer.succeed(CctpService, {
         )
         const version = resolveSourceCctpVersion(
           configService.config,
-          current.burn.sourceDomain,
+          burn.sourceDomain,
         )
         attestation = yield* pollCircleAttestation(
           fetcher,
-          cctp.attestationApiUrl,
-          current.burn,
+          cctpConfig.attestationApiUrl,
+          burn,
           {
-            intervalMs: cctp.attestationPollIntervalMs,
-            timeoutMs: cctp.attestationTimeoutMs,
+            intervalMs: cctpConfig.attestationPollIntervalMs,
+            timeoutMs: cctpConfig.attestationTimeoutMs,
             version,
           },
         )
@@ -316,13 +408,24 @@ export const CctpServiceLive = Layer.succeed(CctpService, {
         textEncoder.encode(JSON.stringify(serialisePending(attested))),
       )
 
-      // 2. Build and submit the mint on the destination chain.
-      const registry = yield* ChainAdapterRegistry
+      // 2. Build and submit the mint on the destination chain. Save
+      //    `minting` before broadcast so a broadcast error or crash
+      //    leaves us in a recoverable state.
       const adapter = yield* registry.get(destChain)
+      const mintMessageBytes = attestation.message.messageBytes
+      if (!mintMessageBytes) {
+        return yield* Effect.fail(
+          new CctpMintError({
+            destChain,
+            cause:
+              "attestation is missing messageBytes — cannot build mint",
+          }),
+        )
+      }
       const mintTx = yield* adapter
         .buildMintTx({
           recipient,
-          messageBytes: attestation.message.messageBytes,
+          messageBytes: mintMessageBytes,
           attestation: attestation.attestation,
         })
         .pipe(
@@ -331,10 +434,21 @@ export const CctpServiceLive = Layer.succeed(CctpService, {
           ),
         )
       const signed = yield* signer.sign(mintTx)
+      const minting: PendingCctpTransfer = {
+        ...attested,
+        status: "minting",
+        mintTxHash: signed.hash,
+        updatedAt: Date.now(),
+      }
+      yield* storage.save(
+        key,
+        textEncoder.encode(JSON.stringify(serialisePending(minting))),
+      )
+
       const mintReceipt = yield* broadcast.submit(signed)
 
       const completed: PendingCctpTransfer = {
-        ...attested,
+        ...minting,
         status: "completed",
         mintTxHash: mintReceipt.hash,
         updatedAt: Date.now(),
@@ -355,8 +469,8 @@ interface SerialisedBurn {
   readonly destDomain: number
   readonly nonce: string
   readonly burnTxHash: string
-  readonly messageBytes: string
-  readonly messageHash: string
+  readonly messageBytes?: string
+  readonly messageHash?: string
 }
 
 interface SerialisedPending {
@@ -381,8 +495,10 @@ const serialiseBurn = (burn: BurnMessage): SerialisedBurn => ({
   destDomain: burn.destDomain,
   nonce: burn.nonce.toString(),
   burnTxHash: burn.burnTxHash,
-  messageBytes: bytesToHex(burn.messageBytes),
-  messageHash: burn.messageHash,
+  ...(burn.messageBytes !== undefined
+    ? { messageBytes: bytesToHex(burn.messageBytes) }
+    : {}),
+  ...(burn.messageHash !== undefined ? { messageHash: burn.messageHash } : {}),
 })
 
 const deserialiseBurn = (b: SerialisedBurn): BurnMessage => ({
@@ -390,8 +506,10 @@ const deserialiseBurn = (b: SerialisedBurn): BurnMessage => ({
   destDomain: b.destDomain,
   nonce: BigInt(b.nonce),
   burnTxHash: b.burnTxHash,
-  messageBytes: hexToBytes(b.messageBytes),
-  messageHash: b.messageHash,
+  ...(b.messageBytes !== undefined
+    ? { messageBytes: hexToBytes(b.messageBytes) }
+    : {}),
+  ...(b.messageHash !== undefined ? { messageHash: b.messageHash } : {}),
 })
 
 const serialisePending = (
