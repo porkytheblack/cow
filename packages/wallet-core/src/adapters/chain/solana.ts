@@ -539,7 +539,6 @@ const buildSolanaCctpMintInstructions = (
       { pubkey: recipientTokenAccount, isSigner: false, isWritable: true },
       { pubkey: custodyTokenAccount, isSigner: false, isWritable: true },
       { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
-      { pubkey: usdcMint, isSigner: false, isWritable: true },
       { pubkey: eventAuthority, isSigner: false, isWritable: false },
       { pubkey: tmm, isSigner: false, isWritable: false }, // program trailing
     ],
