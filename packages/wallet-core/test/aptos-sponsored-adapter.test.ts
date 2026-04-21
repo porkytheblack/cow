@@ -50,9 +50,8 @@ const makeSpyAptos = () => {
             }),
           )
           return {
-            rawTransaction: {
-              bcsToBytes: () => encoded,
-            },
+            bcsToBytes: () => encoded,
+            rawTransaction: { bcsToBytes: () => encoded },
           }
         },
       },

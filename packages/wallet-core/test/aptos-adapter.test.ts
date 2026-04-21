@@ -30,9 +30,10 @@ const makeFakeAptos = () =>
             typeArguments?: unknown[]
           }
         }) => {
-          // Return an object whose rawTransaction.bcsToBytes() returns
-          // a deterministic placeholder blob. Real Aptos client returns
-          // a SimpleTransaction with a real BCS-encoded raw tx.
+          // Return an object whose bcsToBytes() returns a deterministic
+          // placeholder blob. Real Aptos client returns a
+          // SimpleTransaction whose bcsToBytes() is the full
+          // RawTransaction + feePayerAddress + secondarySigners BCS.
           const encoded = new TextEncoder().encode(
             JSON.stringify({
               sender: params.sender.toString(),
@@ -41,9 +42,8 @@ const makeFakeAptos = () =>
             }),
           )
           return {
-            rawTransaction: {
-              bcsToBytes: () => encoded,
-            },
+            bcsToBytes: () => encoded,
+            rawTransaction: { bcsToBytes: () => encoded },
           }
         },
       },

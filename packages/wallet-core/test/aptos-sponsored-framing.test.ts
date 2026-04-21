@@ -18,14 +18,15 @@ const aptosChain: ChainConfig = {
 }
 
 // Fake Aptos that returns real-looking BCS bytes out of `build.simple`
-// so the `RawTransaction.deserialize` call inside broadcast can succeed.
-// We stub broadcast's success path but the framing parser runs for real.
+// so `SimpleTransaction.deserialize` inside broadcast can succeed. We
+// stub broadcast's success path but the framing parser runs for real.
 const makeFakeAptos = (rawBcs: Uint8Array) => {
   let submitCalled = false
   const client = {
     transaction: {
       build: {
         simple: async () => ({
+          bcsToBytes: () => rawBcs,
           rawTransaction: {
             bcsToBytes: () => rawBcs,
           },
@@ -160,12 +161,14 @@ describe("AptosChainAdapter framing parser (sponsored tag)", () => {
   })
 
   it("attachSignature → broadcast round-trips a sponsored tag through the parser", async () => {
-    // Minimum-viable raw BCS blob the SDK can round-trip through
-    // RawTransaction.deserialize. We don't need the broadcast to succeed —
-    // we just need the parser to reach submit.simple, which proves the
-    // tag-aware decode works end to end.
-    const { buildRealRawTx } = await import("./helpers/aptos-rawtx.js")
-    const rawBcs = buildRealRawTx(addressOf(0xa0))
+    // Minimum-viable SimpleTransaction BCS the SDK can round-trip
+    // through SimpleTransaction.deserialize. We don't need the broadcast
+    // to succeed — we just need the parser to reach submit.simple, which
+    // proves the tag-aware decode works end to end.
+    const { buildRealSimpleTx } = await import("./helpers/aptos-rawtx.js")
+    const { simpleBcs: rawBcs } = buildRealSimpleTx(addressOf(0xa0), {
+      sponsored: true,
+    })
 
     let submitSaw: { transaction: unknown; senderAuthenticator: unknown } | null =
       null
@@ -173,6 +176,7 @@ describe("AptosChainAdapter framing parser (sponsored tag)", () => {
       transaction: {
         build: {
           simple: async () => ({
+            bcsToBytes: () => rawBcs,
             rawTransaction: {
               bcsToBytes: () => rawBcs,
             },
