@@ -1,0 +1,71 @@
+name: Version bump
+
+# Auto-bumps the cow-wallet patch version on any PR targeting main whose
+# package.json version still matches main. Commits the bump back to the PR
+# branch. Developers who want a minor/major bump should update package.json
+# themselves before/on the PR — this workflow only fires when the PR's
+# version is unchanged from main.
+#
+# Note: commits pushed with the default GITHUB_TOKEN do NOT trigger further
+# workflow runs (GitHub safety). So this won't retrigger CI on the bump
+# commit — that's intentional, since the diff is metadata-only.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: version-bump-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  bump:
+    name: Bump patch version if unchanged
+    # Skip for forks (GITHUB_TOKEN can't push to a fork) and drafts.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository
+      && github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          # Need main in history for the version comparison.
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Compare PR version to main
+        id: cmp
+        run: |
+          git fetch origin main --depth=1
+          pr_version=$(node -p "require('./packages/wallet-core/package.json').version")
+          main_version=$(git show origin/main:packages/wallet-core/package.json | node -e "let s='';process.stdin.on('data',d=>s+=d).on('end',()=>console.log(JSON.parse(s).version))")
+          echo "pr=$pr_version"     >>"$GITHUB_OUTPUT"
+          echo "main=$main_version" >>"$GITHUB_OUTPUT"
+          if [ "$pr_version" = "$main_version" ]; then
+            echo "should_bump=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "should_bump=false" >>"$GITHUB_OUTPUT"
+            echo "::notice::PR version ($pr_version) already differs from main ($main_version) — no bump needed."
+          fi
+
+      - name: Bump patch version
+        if: steps.cmp.outputs.should_bump == 'true'
+        working-directory: packages/wallet-core
+        run: npm version patch --no-git-tag-version
+
+      - name: Commit and push
+        if: steps.cmp.outputs.should_bump == 'true'
+        run: |
+          new_version=$(node -p "require('./packages/wallet-core/package.json').version")
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add packages/wallet-core/package.json
+          git commit -m "chore: bump cow-wallet to ${new_version}"
+          git push origin HEAD:${{ github.event.pull_request.head.ref }}
