@@ -89,6 +89,7 @@ describe("Aptos CCTP V1 buildMintTx with bundled bytecode", () => {
             capturedArgs = params.data.functionArguments
             capturedBytecode = params.data.bytecode
             return {
+              bcsToBytes: () => new Uint8Array([0x01, 0x02, 0x03]),
               rawTransaction: {
                 bcsToBytes: () => new Uint8Array([0x01, 0x02, 0x03]),
               },

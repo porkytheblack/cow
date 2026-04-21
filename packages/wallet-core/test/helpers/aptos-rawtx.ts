@@ -2,25 +2,29 @@ import {
   AccountAddress,
   ChainId,
   EntryFunction,
-  RawTransaction,
-  TransactionPayloadEntryFunction,
   MoveVector,
+  RawTransaction,
+  SimpleTransaction,
+  TransactionPayloadEntryFunction,
   U8,
 } from "@aptos-labs/ts-sdk"
 
 /**
- * Build a valid BCS-encoded Aptos `RawTransaction` in memory — no
- * network calls. Used in tests to prove the adapter's framing parser
- * can round-trip through `RawTransaction.deserialize`.
+ * Build a `SimpleTransaction` in memory (no network) whose BCS bytes can
+ * round-trip through `SimpleTransaction.deserialize` — matches what the
+ * adapter now serialises with `txn.bcsToBytes()`. Optionally stamps
+ * `feePayerAddress = 0x0` so sponsored-path tests look like the real
+ * gas-station wildcard.
  */
-export const buildRealRawTx = (fromAddressHex: string): Uint8Array => {
+export const buildRealSimpleTx = (
+  fromAddressHex: string,
+  opts: { sponsored?: boolean } = {},
+): { simpleBcs: Uint8Array; rawBcs: Uint8Array } => {
   const sender = AccountAddress.fromString(fromAddressHex)
   const entry = EntryFunction.build(
     "0x1::aptos_account",
     "transfer_coins",
     [],
-    // Arg shape doesn't matter; BCS just needs to round-trip. Keep it
-    // minimal — one empty Move vector of u8.
     [new MoveVector<U8>([new U8(0)])],
   )
   const payload = new TransactionPayloadEntryFunction(entry)
@@ -33,5 +37,9 @@ export const buildRealRawTx = (fromAddressHex: string): Uint8Array => {
     BigInt(Math.floor(Date.now() / 1000) + 600),
     new ChainId(1),
   )
-  return raw.bcsToBytes()
+  const simple = new SimpleTransaction(
+    raw,
+    opts.sponsored ? AccountAddress.ZERO : undefined,
+  )
+  return { rawBcs: raw.bcsToBytes(), simpleBcs: simple.bcsToBytes() }
 }

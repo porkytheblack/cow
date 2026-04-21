@@ -7,7 +7,6 @@ import {
   Ed25519PublicKey,
   Ed25519Signature,
   MoveVector,
-  RawTransaction,
   SimpleTransaction,
   U32,
   U64,
@@ -85,8 +84,9 @@ interface AptosPayload {
     | "cctp-burn"
     | "cctp-mint"
   /**
-   * BCS-serialized Aptos `RawTransaction` bytes (hex). Re-hydrated into
-   * a `SimpleTransaction` at signing and broadcast time.
+   * BCS-serialized `SimpleTransaction` bytes (hex) — the full blob from
+   * `SimpleTransaction.bcsToBytes()`, so `feePayerAddress` and
+   * `secondarySigners` survive the build → sign → broadcast round-trip.
    */
   readonly rawTxHex: string
   readonly asset?: AssetId
@@ -95,10 +95,9 @@ interface AptosPayload {
 }
 
 const rehydrateSimpleTransaction = (rawTxHex: string): SimpleTransaction => {
+  // Full SimpleTransaction BCS: preserves feePayerAddress (= 0x0 wildcard when sponsored).
   const bytes = hexToBytes(rawTxHex)
-  const deserializer = new Deserializer(bytes)
-  const rawTx = RawTransaction.deserialize(deserializer)
-  return new SimpleTransaction(rawTx)
+  return SimpleTransaction.deserialize(new Deserializer(bytes))
 }
 
 // --- Factory ------------------------------------------------------------
@@ -227,7 +226,7 @@ export const makeAptosChainAdapter = (
       Effect.tryPromise({
         try: async () => {
           const txn = await buildTransactionForIntent(params)
-          const rawBytes = txn.rawTransaction.bcsToBytes()
+          const rawBytes = txn.bcsToBytes()
           const payload: AptosPayload = {
             kind: params.asset.type === "native" ? "direct-transfer" : "fungible-transfer",
             rawTxHex: bytesToHex(rawBytes),
@@ -380,7 +379,7 @@ export const makeAptosChainAdapter = (
                     : never,
                 },
               })
-              const rawBytes = txn.rawTransaction.bcsToBytes()
+              const rawBytes = txn.bcsToBytes()
               const payload: AptosPayload = {
                 kind: "entry-function",
                 rawTxHex: bytesToHex(rawBytes),
@@ -505,8 +504,8 @@ export const makeAptosChainAdapter = (
           const pubkeyBytes = framing.slice(5 + len, 5 + len + 32)
           const sigBytes = framing.slice(5 + len + 32)
 
-          const simple = new SimpleTransaction(
-            RawTransaction.deserialize(new Deserializer(rawBytes)),
+          const simple = SimpleTransaction.deserialize(
+            new Deserializer(rawBytes),
           )
           const authenticator = new AccountAuthenticatorEd25519(
             new Ed25519PublicKey(pubkeyBytes),
@@ -579,7 +578,7 @@ export const makeAptosChainAdapter = (
                 ],
               },
             })
-            const rawBytes = txn.rawTransaction.bcsToBytes()
+            const rawBytes = txn.bcsToBytes()
             const payload: AptosPayload = {
               kind: "cctp-burn",
               rawTxHex: bytesToHex(rawBytes),
@@ -704,7 +703,7 @@ export const makeAptosChainAdapter = (
                 ],
               },
             })
-            const rawBytes = txn.rawTransaction.bcsToBytes()
+            const rawBytes = txn.bcsToBytes()
             const payload: AptosPayload = {
               kind: "cctp-mint",
               rawTxHex: bytesToHex(rawBytes),

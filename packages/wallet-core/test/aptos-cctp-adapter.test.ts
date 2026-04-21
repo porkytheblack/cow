@@ -60,17 +60,16 @@ const makeSpyAptos = () => {
             functionArguments: data.functionArguments,
             withFeePayer: params.withFeePayer ?? false,
           })
+          const encoded = new TextEncoder().encode(
+            JSON.stringify({
+              kind: data.bytecode ? "script" : "entry",
+              fn: data.function,
+              hasBytecode: !!data.bytecode,
+            }),
+          )
           return {
-            rawTransaction: {
-              bcsToBytes: () =>
-                new TextEncoder().encode(
-                  JSON.stringify({
-                    kind: data.bytecode ? "script" : "entry",
-                    fn: data.function,
-                    hasBytecode: !!data.bytecode,
-                  }),
-                ),
-            },
+            bcsToBytes: () => encoded,
+            rawTransaction: { bcsToBytes: () => encoded },
           }
         },
       },

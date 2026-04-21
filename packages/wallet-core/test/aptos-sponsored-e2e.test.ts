@@ -15,7 +15,7 @@ import { makeMockFetchAdapter } from "../src/adapters/fetch/mock.js"
 import type { ChainAdapter } from "../src/adapters/chain/index.js"
 import type { ChainConfig, ChainId } from "../src/model/chain.js"
 import { testConfig } from "./helpers/test-config.js"
-import { buildRealRawTx } from "./helpers/aptos-rawtx.js"
+import { buildRealSimpleTx } from "./helpers/aptos-rawtx.js"
 
 const addressOf = (seedByte: number) => {
   const seed = new Uint8Array(32).fill(seedByte)
@@ -34,7 +34,7 @@ interface SubmitCall {
 }
 
 const makeFakeAptos = (
-  rawBcs: Uint8Array,
+  simpleBcs: Uint8Array,
   onSubmit: (call: SubmitCall) => void,
   throwOnSubmit?: Error,
 ) =>
@@ -42,8 +42,9 @@ const makeFakeAptos = (
     transaction: {
       build: {
         simple: async () => ({
+          bcsToBytes: () => simpleBcs,
           rawTransaction: {
-            bcsToBytes: () => rawBcs,
+            bcsToBytes: () => simpleBcs,
           },
         }),
       },
@@ -95,9 +96,9 @@ const makeSponsoredHarness = (aptos: Aptos) => {
 describe("Aptos sponsored end-to-end (SignerService wiring)", () => {
   it("signs + broadcasts sponsored tx; never leaks private key; no fee-payer authenticator ever passed", async () => {
     const from = addressOf(0xb0)
-    const rawBcs = buildRealRawTx(from)
+    const { simpleBcs, rawBcs } = buildRealSimpleTx(from, { sponsored: true })
     const submitCalls: SubmitCall[] = []
-    const aptos = makeFakeAptos(rawBcs, (c) => submitCalls.push(c))
+    const aptos = makeFakeAptos(simpleBcs, (c) => submitCalls.push(c))
 
     // Wrap the adapter so we can assert that the raw private key never
     // crosses the attachSignature boundary (parallel to signer.test.ts).
@@ -155,9 +156,9 @@ describe("Aptos sponsored end-to-end (SignerService wiring)", () => {
 
   it("surfaces gas-station policy rejections as BroadcastError with cause preserved", async () => {
     const from = addressOf(0xc0)
-    const rawBcs = buildRealRawTx(from)
+    const { simpleBcs } = buildRealSimpleTx(from, { sponsored: true })
     const policyErr = new Error("policy: function not whitelisted")
-    const aptos = makeFakeAptos(rawBcs, () => {}, policyErr)
+    const aptos = makeFakeAptos(simpleBcs, () => {}, policyErr)
 
     const { layer } = makeSponsoredHarness(aptos)
 
@@ -191,9 +192,9 @@ describe("Aptos sponsored end-to-end (SignerService wiring)", () => {
 
   it("surfaces 429-shaped errors as BroadcastError (no automatic retry)", async () => {
     const from = addressOf(0xd0)
-    const rawBcs = buildRealRawTx(from)
+    const { simpleBcs } = buildRealSimpleTx(from, { sponsored: true })
     const rateLimit = new Error("429 Too Many Requests")
-    const aptos = makeFakeAptos(rawBcs, () => {}, rateLimit)
+    const aptos = makeFakeAptos(simpleBcs, () => {}, rateLimit)
     const { layer } = makeSponsoredHarness(aptos)
 
     const program = Effect.gen(function* () {

@@ -1,0 +1,80 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      # Needed for `npm publish --provenance` OIDC.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so we can tag releases with annotated context.
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: "https://registry.npmjs.org"
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Resolve package name + version
+        id: pkg
+        working-directory: packages/wallet-core
+        run: |
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          echo "name=$name" >>"$GITHUB_OUTPUT"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+      - name: Check whether this version is already on npm
+        id: check
+        run: |
+          if npm view "${{ steps.pkg.outputs.name }}@${{ steps.pkg.outputs.version }}" version >/dev/null 2>&1; then
+            echo "already_published=true" >>"$GITHUB_OUTPUT"
+            echo "::notice::${{ steps.pkg.outputs.name }}@${{ steps.pkg.outputs.version }} is already on npm — skipping publish."
+          else
+            echo "already_published=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Typecheck
+        if: steps.check.outputs.already_published == 'false'
+        run: pnpm typecheck
+
+      - name: Test
+        if: steps.check.outputs.already_published == 'false'
+        run: pnpm test
+
+      - name: Build
+        if: steps.check.outputs.already_published == 'false'
+        run: pnpm build
+
+      - name: Publish to npm
+        if: steps.check.outputs.already_published == 'false'
+        working-directory: packages/wallet-core
+        run: pnpm publish --access public --no-git-checks --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Tag release
+        if: steps.check.outputs.already_published == 'false'
+        run: |
+          tag="v${{ steps.pkg.outputs.version }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "$tag"
+          git push origin "$tag"

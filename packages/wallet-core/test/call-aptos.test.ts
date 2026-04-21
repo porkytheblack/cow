@@ -48,9 +48,8 @@ const makeFakeAptos = (simulateResponse?: unknown) =>
             }),
           )
           return {
-            rawTransaction: {
-              bcsToBytes: () => encoded,
-            },
+            bcsToBytes: () => encoded,
+            rawTransaction: { bcsToBytes: () => encoded },
           }
         },
       },
