@@ -1,8 +1,21 @@
 {
   "name": "cow-wallet",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "COol Wallet — multichain wallet library (Aptos, Solana, EVM) with CCTP V1/V2 cross-chain USDC transfers",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/porkytheblack/cow.git",
+    "directory": "packages/wallet-core"
+  },
+  "homepage": "https://github.com/porkytheblack/cow#readme",
+  "bugs": {
+    "url": "https://github.com/porkytheblack/cow/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "sideEffects": false,
   "main": "./dist/index.js",
   "module": "./dist/index.js",
