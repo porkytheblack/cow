@@ -482,6 +482,11 @@ const buildSolanaCctpMintInstructions = (
     ],
     mt,
   )
+  // MT's own `#[event_cpi]` accounts — required so MT can `emit_cpi!` the
+  // MessageReceived event before returning. Missing these shifts the
+  // remaining_accounts seen by TMM's handle_receive_message and trips
+  // Anchor's seeds check (ConstraintSeeds / 0x7d6).
+  const mtEventAuthority = findPda([textBytes("__event_authority")], mt)
 
   // TokenMessengerMinter remaining accounts (CPI target).
   const tokenMessengerState = findPda([textBytes("token_messenger")], tmm)
@@ -530,6 +535,9 @@ const buildSolanaCctpMintInstructions = (
       { pubkey: usedNonces, isSigner: false, isWritable: true },
       { pubkey: tmm, isSigner: false, isWritable: false }, // receiver = TokenMessengerMinter program
       { pubkey: SYSTEM_PROGRAM_ID, isSigner: false, isWritable: false },
+      // MT's own #[event_cpi] pair — event_authority PDA + MT program id.
+      { pubkey: mtEventAuthority, isSigner: false, isWritable: false },
+      { pubkey: mt, isSigner: false, isWritable: false },
       // remaining_accounts forwarded to handle_receive_message CPI:
       { pubkey: tokenMessengerState, isSigner: false, isWritable: false },
       { pubkey: remoteTokenMessenger, isSigner: false, isWritable: false },
