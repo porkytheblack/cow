@@ -832,22 +832,27 @@ export const makeEvmChainAdapter = (
             attestationHex as Hex,
           ],
         })
-        const tx: UnsignedTx = {
+        const basePayload: EvmCallPayload = {
+          kind: "cctp-mint",
+          to: cctpContracts.messageTransmitter,
+          value: 0n,
+          data,
+        }
+        const enriched = yield* enrichPayloadWithFees(basePayload, recipient)
+        const totalFee =
+          enriched.maxFeePerGas !== undefined
+            ? enriched.gas! * enriched.maxFeePerGas
+            : enriched.gas! * (enriched.gasPrice ?? 0n)
+        return {
           chain: chainConfig.chainId,
           from: recipient,
-          payload: {
-            kind: "cctp-mint",
-            to: cctpContracts.messageTransmitter,
-            value: 0n,
-            data,
-          } satisfies EvmCallPayload,
-          estimatedFee: 200_000n * 20_000_000_000n, // rough upper bound
+          payload: enriched,
+          estimatedFee: totalFee,
           metadata: {
             intent: `CCTP mint on ${String(chainConfig.chainId)}`,
             createdAt: Date.now(),
           },
-        }
-        return tx
+        } satisfies UnsignedTx
       }),
   }
 

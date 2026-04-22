@@ -226,6 +226,55 @@ describe("EvmChainAdapter", () => {
     expect(tx.metadata.intent).toContain("V1")
   })
 
+  it("buildMintTx enriches the payload with gas, fees and nonce", async () => {
+    const captured: { method: string; params: unknown }[] = []
+    const fetchLayer = mockRpc(
+      {
+        eth_estimateGas: "0x5208",
+        eth_getTransactionCount: "0x5",
+        eth_maxPriorityFeePerGas: "0x77359400", // 2 gwei tip
+        eth_getBlockByNumber: { baseFeePerGas: "0xaa" },
+      },
+      captured,
+    )
+    const program = Effect.gen(function* () {
+      const fetcher = yield* FetchAdapter
+      const adapter = makeEvmChainAdapter({
+        chainConfig: evmChain,
+        fetcher,
+        cctpContracts: {
+          tokenMessenger: "0x1234567890123456789012345678901234567890",
+          messageTransmitter: "0x0987654321098765432109876543210987654321",
+          usdcToken: USDC.address as `0x${string}`,
+        },
+      })
+      return yield* adapter.buildMintTx({
+        recipient: "0x1111111111111111111111111111111111111111",
+        messageBytes: new Uint8Array([0x01, 0x02, 0x03]),
+        attestation: "0xdeadbeef",
+      })
+    })
+    const tx = await Effect.runPromise(Effect.provide(program, fetchLayer))
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const payload = tx.payload as any
+    expect(payload.kind).toBe("cctp-mint")
+    expect(payload.gas).toBe(21_000n)
+    // maxFeePerGas = 2 * baseFee + priority = 2 * 0xaa + 0x77359400
+    expect(payload.maxFeePerGas).toBe(2n * 0xaan + 0x77359400n)
+    expect(payload.maxPriorityFeePerGas).toBe(0x77359400n)
+    expect(payload.nonce).toBe(5)
+    expect(tx.estimatedFee).toBe(payload.gas * payload.maxFeePerGas)
+    const methodsCalled = captured.map((c) => c.method).sort()
+    expect(methodsCalled).toEqual(
+      [
+        "eth_estimateGas",
+        "eth_getBlockByNumber",
+        "eth_getTransactionCount",
+        "eth_maxPriorityFeePerGas",
+      ].sort(),
+    )
+  })
+
   it("encodes a CCTP V2 depositForBurn payload", () => {
     const tx = buildEvmCctpBurnTx(
       evmChain,
