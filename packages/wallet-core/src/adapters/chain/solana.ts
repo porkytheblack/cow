@@ -569,6 +569,19 @@ export interface SolanaAdapterOptions {
    * disable CCTP entirely and surface `UnsupportedRouteError`.
    */
   readonly cctpContracts?: SolanaCctpV1Contracts
+  /**
+   * Retry policy for burn reconciliation RPCs (`getTransaction` and
+   * `getAccountInfo`). `broadcast` returns as soon as the signature
+   * hits `confirmed`, but Helius and most other RPCs take 1–3s more
+   * to serve the tx via the history indexer — a single-shot fetch
+   * races that indexer and returns `null`, which the caller would
+   * otherwise surface as a bogus "no MessageSent account" error.
+   * Defaults to 5 attempts × 1000 ms.
+   */
+  readonly reconcileRetry?: {
+    readonly attempts?: number
+    readonly intervalMs?: number
+  }
 }
 
 export const makeSolanaChainAdapter = (
@@ -582,6 +595,10 @@ export const makeSolanaChainAdapter = (
     tmm: new PublicKey(cctp.tokenMessengerMinterProgramId),
     mt: new PublicKey(cctp.messageTransmitterProgramId),
     usdc: new PublicKey(cctp.usdcMint),
+  }
+  const reconcileRetry = {
+    attempts: opts.reconcileRetry?.attempts ?? 5,
+    intervalMs: opts.reconcileRetry?.intervalMs ?? 1_000,
   }
 
   const rpc = <T>(method: string, params: unknown = []) =>
@@ -1114,6 +1131,7 @@ export const makeSolanaChainAdapter = (
           chainConfig,
           cctp.tokenMessengerMinterProgramId,
           receipt.hash,
+          reconcileRetry,
         )
         if (!reconciled) {
           return yield* Effect.fail(
@@ -1121,7 +1139,7 @@ export const makeSolanaChainAdapter = (
               chain: String(chainConfig.chainId),
               hash: receipt.hash,
               cause:
-                "Solana receipt has no cctpBurn metadata and on-chain reconciliation yielded no MessageSent account",
+                "Solana burn reconciliation failed: tx not yet indexed by the RPC after retries, or MessageSent account is missing/closed",
             }),
           )
         }
@@ -1134,6 +1152,7 @@ export const makeSolanaChainAdapter = (
         chainConfig,
         cctp.tokenMessengerMinterProgramId,
         hash,
+        reconcileRetry,
       ),
 
     buildMintTx: ({ recipient, messageBytes, attestation }) =>
@@ -1244,25 +1263,45 @@ interface SolanaAccountInfoResponse {
  *   | 4 bytes  message length (u32 LE)  ← Anchor Vec<u8> prefix
  *   | N bytes  message ]
  *
- * Returns `null` when the tx is not yet visible, has reverted, or the
- * `MessageSent` account has been closed (rent reclaimed). The caller
- * treats `null` as "not confirmed yet" and retries.
+ * Both the `getTransaction` and `getAccountInfo` calls are retried with
+ * a small fixed backoff to absorb history-indexer lag on public RPCs
+ * like Helius, which can trail `getSignatureStatuses === "confirmed"`
+ * by 1–3s.
+ *
+ * Returns `null` when the tx is not yet visible after retries, has
+ * reverted, or the `MessageSent` account has been closed (rent
+ * reclaimed). The caller treats `null` as "not confirmed yet" and
+ * retries at a higher level.
  */
 const extractBurnMessageFromSolanaTx = (
   rpc: <T>(method: string, params?: unknown) => Effect.Effect<T, unknown>,
   _chainConfig: ChainConfig,
   tokenMessengerMinterProgramId: string,
   signature: string,
+  retry: { readonly attempts: number; readonly intervalMs: number },
 ): Effect.Effect<BurnMessage | null, BroadcastError> =>
   Effect.gen(function* () {
-    const txRes = yield* rpc<SolanaTxResponse | null>("getTransaction", [
-      signature,
-      {
-        commitment: "confirmed",
-        encoding: "json",
-        maxSupportedTransactionVersion: 0,
-      },
-    ]).pipe(Effect.catchAll(() => Effect.succeed(null)))
+    // `broadcast` returns as soon as `getSignatureStatuses` reports
+    // `confirmed`, but the history indexer behind `getTransaction`
+    // commonly lags by 1–3s on Helius and other RPCs. A single-shot
+    // fetch races that indexer and returns null, which the caller
+    // would otherwise surface as a bogus "no MessageSent account"
+    // error. Retry with a small fixed backoff to absorb that lag.
+    let txRes: SolanaTxResponse | null = null
+    for (let attempt = 0; attempt < retry.attempts; attempt++) {
+      txRes = yield* rpc<SolanaTxResponse | null>("getTransaction", [
+        signature,
+        {
+          commitment: "confirmed",
+          encoding: "json",
+          maxSupportedTransactionVersion: 0,
+        },
+      ]).pipe(Effect.catchAll(() => Effect.succeed(null)))
+      if (txRes) break
+      if (attempt < retry.attempts - 1) {
+        yield* Effect.sleep(retry.intervalMs)
+      }
+    }
     if (!txRes) return null
     if (txRes.meta?.err != null) return null
 
@@ -1290,10 +1329,23 @@ const extractBurnMessageFromSolanaTx = (
     }
     if (!eventAccountKey) return null
 
-    const info = yield* rpc<SolanaAccountInfoResponse>("getAccountInfo", [
-      eventAccountKey,
-      { encoding: "base64" },
-    ]).pipe(Effect.catchAll(() => Effect.succeed({ value: null } as SolanaAccountInfoResponse)))
+    // The event account is created in the same tx as the burn; on
+    // slow RPCs the `getAccountInfo` index can also lag briefly.
+    let info: SolanaAccountInfoResponse = { value: null }
+    for (let attempt = 0; attempt < retry.attempts; attempt++) {
+      info = yield* rpc<SolanaAccountInfoResponse>("getAccountInfo", [
+        eventAccountKey,
+        { encoding: "base64" },
+      ]).pipe(
+        Effect.catchAll(() =>
+          Effect.succeed({ value: null } as SolanaAccountInfoResponse),
+        ),
+      )
+      if (info.value) break
+      if (attempt < retry.attempts - 1) {
+        yield* Effect.sleep(retry.intervalMs)
+      }
+    }
     if (!info.value) return null
 
     const raw = Array.isArray(info.value.data)

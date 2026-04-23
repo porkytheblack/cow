@@ -1,6 +1,6 @@
 {
   "name": "cow-wallet",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "COol Wallet — multichain wallet library (Aptos, Solana, EVM) with CCTP V1/V2 cross-chain USDC transfers",
   "type": "module",
   "repository": {

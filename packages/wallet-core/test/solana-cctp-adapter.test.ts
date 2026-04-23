@@ -50,6 +50,49 @@ const mockRpc = (responses: Record<string, unknown>) =>
     fallbackTo404: true,
   })
 
+// Stateful variant: each method maps to a sequence of responses, one
+// returned per call. Once the sequence is exhausted the last element
+// is reused. `null` is a legitimate result (e.g. getTransaction
+// returning null before the indexer catches up); `undefined` means
+// "no mock registered for this method".
+const mockRpcSequence = (
+  responses: Record<string, ReadonlyArray<unknown>>,
+  counts?: Record<string, number>,
+) =>
+  makeMockFetchAdapter({
+    handlers: [
+      [
+        "rpc.test",
+        (req) => {
+          const body = JSON.parse(
+            typeof req.body === "string"
+              ? req.body
+              : new TextDecoder().decode(req.body as Uint8Array),
+          ) as { method: string }
+          const seq = responses[body.method]
+          if (!seq) {
+            return {
+              status: 200,
+              body: {
+                jsonrpc: "2.0",
+                id: 1,
+                error: { code: -32601, message: "no mock" },
+              },
+            }
+          }
+          const n = counts ? (counts[body.method] ?? 0) : 0
+          if (counts) counts[body.method] = n + 1
+          const result = seq[Math.min(n, seq.length - 1)]
+          return {
+            status: 200,
+            body: { jsonrpc: "2.0", id: 1, result },
+          }
+        },
+      ],
+    ],
+    fallbackTo404: true,
+  })
+
 const blockhashMock = mockRpc({
   getLatestBlockhash: {
     context: { slot: 100 },
@@ -339,5 +382,86 @@ describe("SolanaChainAdapter CCTP V1", () => {
     expect(burn!.destDomain).toBe(0)
     expect(burn!.nonce).toBe(42n)
     expect(burn!.messageBytes!.length).toBe(248)
+  })
+
+  it("extractBurnMessageFromTx retries getTransaction while the history indexer catches up", async () => {
+    // Regression: `broadcast` returns once getSignatureStatuses hits
+    // `confirmed`, but Helius and most public RPCs take 1–3s longer
+    // to serve the tx via getTransaction. A single-shot fetch raced
+    // that indexer — the null response surfaced as a bogus
+    // "no MessageSent account" error. The adapter should retry
+    // getTransaction and absorb the lag before giving up.
+    const MSG_LEN = 248
+    const message = new Uint8Array(MSG_LEN)
+    message[7] = 5 // sourceDomain = 5 (Solana)
+    message[11] = 0 // destDomain = 0
+    message[19] = 7 // nonce = 7
+
+    const account = new Uint8Array(8 + 32 + 4 + MSG_LEN)
+    for (let i = 0; i < 8; i++) account[i] = i + 1
+    for (let i = 8; i < 40; i++) account[i] = 0xcc
+    account[40] = MSG_LEN & 0xff
+    account[41] = (MSG_LEN >>> 8) & 0xff
+    account[42] = (MSG_LEN >>> 16) & 0xff
+    account[43] = (MSG_LEN >>> 24) & 0xff
+    account.set(message, 44)
+    let binary = ""
+    for (const b of account) binary += String.fromCharCode(b)
+    const accountB64 = btoa(binary)
+
+    const eventAccountKey = new PublicKey(
+      new Uint8Array(32).fill(0x22),
+    ).toBase58()
+    const tmm = DEFAULT_SOLANA_CCTP_V1.tokenMessengerMinterProgramId
+
+    const realTxResponse = {
+      meta: { err: null },
+      transaction: {
+        message: {
+          accountKeys: [tmm, eventAccountKey],
+          instructions: [
+            {
+              programIdIndex: 0,
+              accounts: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            },
+          ],
+        },
+      },
+    }
+    const realAccountInfo = {
+      context: { slot: 100 },
+      value: { data: [accountB64, "base64"] },
+    }
+
+    const counts: Record<string, number> = {}
+    const racingMock = mockRpcSequence(
+      {
+        // First 3 calls race the indexer and come back empty, the 4th
+        // finally returns the indexed tx.
+        getTransaction: [null, null, null, realTxResponse],
+        getAccountInfo: [realAccountInfo],
+      },
+      counts,
+    )
+
+    const program = Effect.gen(function* () {
+      const fetcher = yield* FetchAdapter
+      const adapter = makeSolanaChainAdapter({
+        chainConfig: solChain,
+        fetcher,
+        // Keep the test fast — interval of 10ms × 5 attempts still
+        // exercises the exact retry loop shipped to production.
+        reconcileRetry: { attempts: 5, intervalMs: 10 },
+      })
+      return yield* adapter.extractBurnMessageFromTx("5aakZGdummysignature")
+    })
+    const burn = await Effect.runPromise(Effect.provide(program, racingMock))
+    expect(burn).not.toBeNull()
+    expect(burn!.sourceDomain).toBe(5)
+    expect(burn!.destDomain).toBe(0)
+    expect(burn!.nonce).toBe(7n)
+    expect(burn!.messageBytes!.length).toBe(248)
+    // 4 getTransaction calls: 3 racing the indexer + 1 successful.
+    expect(counts.getTransaction).toBe(4)
   })
 })
