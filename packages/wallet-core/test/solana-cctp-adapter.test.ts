@@ -268,4 +268,76 @@ describe("SolanaChainAdapter CCTP V1", () => {
     expect(signed.raw[0]).toBe(0x02)
     expect(signed.raw.length).toBeGreaterThan(1 + 64 + 64)
   })
+
+  it("extractBurnMessageFromTx reads msg_len at offset 40 on the MessageSent account", async () => {
+    // Regression: Circle's V1 MessageSent Anchor account layout is
+    // [8 disc | 32 rent_payer | 4 u32 LE msg_len | N bytes msg] — the
+    // length sits at offset 40, not 48. A prior build hardcoded 48 and
+    // every Solana-origin burn failed reconciliation.
+    const MSG_LEN = 248
+    const message = new Uint8Array(MSG_LEN)
+    // CCTP V1 outer message header (all big-endian):
+    //   version(4)|sourceDomain(4)|destDomain(4)|nonce(8)|sender(32)|recipient(32)|destCaller(32)
+    // sourceDomain = 5 (Solana), destDomain = 0 (Ethereum), nonce = 42.
+    message[7] = 5
+    message[11] = 0
+    message[19] = 42
+
+    const account = new Uint8Array(8 + 32 + 4 + MSG_LEN)
+    for (let i = 0; i < 8; i++) account[i] = i + 1 // arbitrary discriminator
+    for (let i = 8; i < 40; i++) account[i] = 0xcc // arbitrary rent_payer
+    // u32 LE msg_len = 248 at offset 40
+    account[40] = MSG_LEN & 0xff
+    account[41] = (MSG_LEN >>> 8) & 0xff
+    account[42] = (MSG_LEN >>> 16) & 0xff
+    account[43] = (MSG_LEN >>> 24) & 0xff
+    account.set(message, 44)
+
+    let binary = ""
+    for (const b of account) binary += String.fromCharCode(b)
+    const accountB64 = btoa(binary)
+
+    const eventAccountKey = new PublicKey(
+      new Uint8Array(32).fill(0x11),
+    ).toBase58()
+    const tmm = DEFAULT_SOLANA_CCTP_V1.tokenMessengerMinterProgramId
+
+    const fixtureMock = mockRpc({
+      getTransaction: {
+        meta: { err: null },
+        transaction: {
+          message: {
+            accountKeys: [tmm, eventAccountKey],
+            instructions: [
+              {
+                programIdIndex: 0,
+                // 11 entries — index 10 is the message_sent_event_data
+                // account (accountKeys[1]).
+                accounts: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+              },
+            ],
+          },
+        },
+      },
+      getAccountInfo: {
+        context: { slot: 100 },
+        value: { data: [accountB64, "base64"] },
+      },
+    })
+
+    const program = Effect.gen(function* () {
+      const fetcher = yield* FetchAdapter
+      const adapter = makeSolanaChainAdapter({
+        chainConfig: solChain,
+        fetcher,
+      })
+      return yield* adapter.extractBurnMessageFromTx("5aakZGdummysignature")
+    })
+    const burn = await Effect.runPromise(Effect.provide(program, fixtureMock))
+    expect(burn).not.toBeNull()
+    expect(burn!.sourceDomain).toBe(5)
+    expect(burn!.destDomain).toBe(0)
+    expect(burn!.nonce).toBe(42n)
+    expect(burn!.messageBytes!.length).toBe(248)
+  })
 })

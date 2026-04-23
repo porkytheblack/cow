@@ -1241,7 +1241,6 @@ interface SolanaAccountInfoResponse {
  *
  *   [ 8 bytes  discriminator
  *   | 32 bytes rent_payer
- *   | 8 bytes  created_at (i64 LE)
  *   | 4 bytes  message length (u32 LE)  ← Anchor Vec<u8> prefix
  *   | N bytes  message ]
  *
@@ -1307,8 +1306,8 @@ const extractBurnMessageFromSolanaTx = (
     } catch {
       return null
     }
-    // 8 (disc) + 32 (rent_payer) + 8 (i64 created_at) + 4 (u32 len)
-    const MSG_LEN_OFFSET = 48
+    // 8 (disc) + 32 (rent_payer) = 40; next 4 bytes are the u32 LE msg length
+    const MSG_LEN_OFFSET = 40
     if (accountBytes.length < MSG_LEN_OFFSET + 4) return null
     const msgLen = u32LeFromBytes(accountBytes, MSG_LEN_OFFSET)
     const msgStart = MSG_LEN_OFFSET + 4
